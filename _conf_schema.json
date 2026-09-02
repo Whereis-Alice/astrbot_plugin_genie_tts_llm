@@ -375,5 +375,40 @@
         "default": "请对以下中文内容进行翻译和情感分析。首先翻译成日语，然后从以下情感列表中选择最合适的一个：{emotion_list}。请按以下格式输出：\n[翻译后的日语文本][选择的情感名]\n\n原文：{text}"
       }
     }
+  },
+  "enable_tts_leak_guard": {
+    "title": "参考音频泄漏防护",
+    "description": "异常长音频重试",
+    "hint": "开启后，若合成结果的时长明显超过文本预期（Genie 在极端情况下会把参考音频拼进结果，表现为“上一次的语音 + 这次的语音”叠成一条），插件会丢弃该结果并自动重试一次，最终保留较短的那份。建议保持开启。",
+    "type": "bool",
+    "default": true
+  },
+  "tts_leak_guard_seconds_per_char": {
+    "title": "泄漏防护每字秒数",
+    "description": "预期时长系数",
+    "hint": "泄漏防护用来估算音频的预期上限时长：预期秒数 = 可发音字符数 × 本值 + 停顿标记总时长。值越小越严格、越容易触发重试。低于 0.2 会被自动修正为 0.2。语速偏慢的角色可以适当调大。",
+    "type": "float",
+    "default": 0.9
+  },
+  "tts_leak_guard_min_seconds": {
+    "title": "泄漏防护最小基线",
+    "description": "短文本兜底秒数",
+    "hint": "预期时长的下限，避免极短文本（例如一两个字）因为固有的起止静音被误判成泄漏。低于 1.0 会被自动修正为 1.0。",
+    "type": "float",
+    "default": 3.0
+  },
+  "enable_state_persistence": {
+    "title": "开关状态持久化",
+    "description": "重启不丢设置",
+    "hint": "开启后，会话/群聊的语音开关、自动情感模式以及各会话选择的角色与感情会写入插件 KV 存储，AstrBot 重启后自动恢复。关闭则回到旧行为：所有运行时开关在重启后重置为默认值。",
+    "type": "bool",
+    "default": true
+  },
+  "enable_tts_failure_notice": {
+    "title": "失败提示追加到回复",
+    "description": "回复末尾提示",
+    "hint": "开启时，语音合成或发送失败会在文本回复末尾追加一行形如 (TTS失败: 原因) 的提示，方便排查。关闭后失败只写日志，不打扰聊天内容。",
+    "type": "bool",
+    "default": true
   }
 }

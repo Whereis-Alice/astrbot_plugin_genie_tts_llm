@@ -14,7 +14,7 @@ from astrbot.api.provider import LLMResponse, ProviderRequest
 
 # 从新模块导入功能
 from .emotion_manager import EmotionManager
-from .tts_engine import TTSEngine
+from .tts_engine import TTSEngine, has_pronounceable
 from .external_apis import translate_text
 
 
@@ -22,10 +22,19 @@ from .external_apis import translate_text
     "astrbot_plugin_genie_tts_llm",
     "Whereis-Alice",
     "一个通过 LLM、翻译和 Genie TTS 实现语音合成的插件，支持主动语音工具",
-    "1.7.1",
+    "1.8.0",
     "https://github.com/Whereis-Alice/astrbot_plugin_genie_tts_llm",
 )
 class GenieTtsLlmPlugin(Star):
+    # 会话开关/音色选择的持久化键。AstrBot 的插件 KV 存储按 plugin_id 隔离。
+    STATE_KV_KEY = "session_state_v1"
+    # 最多记住多少个会话的"最近一条语音"，避免长期运行后字典无限增长。
+    MAX_REMEMBERED_AUDIO = 200
+    # 清理 LLM 复读的历史 TTS 失败提示。整条匹配，不留残渣。
+    TTS_FAILURE_NOTICE_PATTERN = re.compile(
+        r"\n?\(TTS(?:失败[：:][^)]*|合成失败|音频发送失败)\)"
+    )
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
@@ -42,6 +51,11 @@ class GenieTtsLlmPlugin(Star):
         self._keepalive_stop_event = asyncio.Event()
         self._keepalive_task: Optional[asyncio.Task] = None
         self._llm_translation_conflict_logged = False
+        # 会话 -> 最近一次成功合成的临时音频路径，供 /tts-again 复用。
+        self.last_audio_paths: Dict[str, str] = {}
+        self._state_lock = asyncio.Lock()
+        self._state_restored = asyncio.Event()
+        self._state_restore_task: Optional[asyncio.Task] = None
 
         # 初始化辅助模块
         plugin_data_dir = StarTools.get_data_dir("astrbot_plugin_genie_tts_llm")
@@ -65,7 +79,130 @@ class GenieTtsLlmPlugin(Star):
         if self.config.get("enable_group_tts_by_default", False):
             logger.info("已开启全部群默认语音合成；群组黑名单仍优先。")
 
+        # KV 读取是协程，__init__ 里只能挂后台任务；恢复完成后置位 _state_restored。
+        self._state_restore_task = asyncio.create_task(self._restore_state())
+
         logger.info("LLM TTS 插件已加载。")
+
+    # ------------------------------------------------------------ 状态持久化
+
+    @staticmethod
+    def _as_str_set(value: object) -> Set[str]:
+        """把持久化数据里的任意结构安全转成字符串集合。"""
+        if not isinstance(value, (list, tuple, set)):
+            return set()
+        return {str(item) for item in value if item}
+
+    @staticmethod
+    def _as_profile_map(
+        value: object, keys: Tuple[str, ...]
+    ) -> Dict[str, Dict[str, str]]:
+        """转成 {会话: {字段: 值}}；字段不齐的脏数据直接丢弃，避免后续 KeyError。"""
+        if not isinstance(value, dict):
+            return {}
+        restored: Dict[str, Dict[str, str]] = {}
+        for session_id, payload in value.items():
+            if not session_id or not isinstance(payload, dict):
+                continue
+            if any(not payload.get(key) for key in keys):
+                continue
+            restored[str(session_id)] = {key: str(payload[key]) for key in keys}
+        return restored
+
+    def _state_persistence_enabled(self) -> bool:
+        return bool(self.config.get("enable_state_persistence", True))
+
+    async def _restore_state(self) -> None:
+        """从插件 KV 存储恢复上次的会话/群组开关与音色选择。"""
+        try:
+            if not self._state_persistence_enabled():
+                return
+
+            saved = await self.get_kv_data(self.STATE_KV_KEY, None)
+            if not isinstance(saved, dict):
+                return
+
+            self.active_sessions.update(self._as_str_set(saved.get("active_sessions")))
+            self.w_active_sessions.update(
+                self._as_str_set(saved.get("w_active_sessions"))
+            )
+            self.active_groups.update(self._as_str_set(saved.get("active_groups")))
+            self.inactive_groups.update(self._as_str_set(saved.get("inactive_groups")))
+            self.session_emotions.update(
+                self._as_profile_map(
+                    saved.get("session_emotions"), ("character", "emotion")
+                )
+            )
+            self.session_w_settings.update(
+                self._as_profile_map(saved.get("session_w_settings"), ("character",))
+            )
+
+            # 同一会话不能同时是固定情感模式和自动情感识别模式，自动模式优先。
+            self.active_sessions -= self.w_active_sessions
+            # 运行时手动关掉的群，优先级高于 __init__ 里的白名单自动开启。
+            self.active_groups -= self.inactive_groups
+
+            logger.info(
+                "已恢复 TTS 会话状态 | 固定情感会话: %d | 自动情感会话: %d | "
+                "已开启群: %d | 已关闭群: %d"
+                % (
+                    len(self.active_sessions),
+                    len(self.w_active_sessions),
+                    len(self.active_groups),
+                    len(self.inactive_groups),
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"恢复 TTS 会话状态失败，本次以空状态启动: {exc}")
+        finally:
+            self._state_restored.set()
+
+    async def _persist_state(self) -> None:
+        """把会话/群组开关与音色选择写回插件 KV 存储。失败只告警，不影响本次指令。"""
+        if not self._state_persistence_enabled():
+            return
+
+        payload = {
+            "active_sessions": sorted(self.active_sessions),
+            "w_active_sessions": sorted(self.w_active_sessions),
+            "active_groups": sorted(self.active_groups),
+            "inactive_groups": sorted(self.inactive_groups),
+            "session_emotions": {
+                key: dict(value) for key, value in self.session_emotions.items()
+            },
+            "session_w_settings": {
+                key: dict(value) for key, value in self.session_w_settings.items()
+            },
+        }
+        try:
+            async with self._state_lock:
+                await self.put_kv_data(self.STATE_KV_KEY, payload)
+        except Exception as exc:
+            logger.warning(f"保存 TTS 会话状态失败（不影响本次操作）: {exc}")
+
+    def _remember_last_audio(
+        self, session_id: str, audio_path: Optional[str]
+    ) -> Optional[str]:
+        """记下会话最近一条语音供 /tts-again 复用，并按 LRU 限制字典长度。"""
+        if not session_id or not audio_path:
+            return audio_path
+        # 先 pop 再插入，让 dict 的插入顺序等价于访问顺序。
+        self.last_audio_paths.pop(session_id, None)
+        self.last_audio_paths[session_id] = audio_path
+        while len(self.last_audio_paths) > self.MAX_REMEMBERED_AUDIO:
+            self.last_audio_paths.pop(next(iter(self.last_audio_paths)), None)
+        return audio_path
+
+    def _append_tts_failure_notice(self, resp: LLMResponse, reason: str) -> None:
+        """在回复末尾追加 TTS 失败提示；用户可在配置里关掉这些提示。"""
+        if not self.config.get("enable_tts_failure_notice", True):
+            logger.info(f"TTS 失败提示已按配置隐藏: {reason}")
+            return
+        resp.result_chain.chain.append(Comp.Plain(f"\n({reason})"))
+
+    # ------------------------------------------------------------ 群组与触发
 
     def _normalize_group_id(self, group_id: Optional[object]) -> str:
         """统一群号格式，避免配置里的字符串和事件里的数字不匹配。"""
@@ -661,9 +798,14 @@ class GenieTtsLlmPlugin(Star):
         )
 
         if audio_path:
+            self._remember_last_audio(event.unified_msg_origin, audio_path)
             yield event.chain_result([Comp.Record(file=audio_path)])
         else:
-            yield event.plain_result("语音合成失败，请检查服务器状态或日志。")
+            yield event.plain_result(
+                "语音合成失败。\n"
+                "• 若文本里只有标点或表情符号，是不会生成语音的；\n"
+                "• 其它情况可用 /tts-status 检查服务器与队列。"
+            )
         event.stop_event()
 
     @filter.command("tts-llm", alias={"开启语音合成"})
@@ -676,6 +818,7 @@ class GenieTtsLlmPlugin(Star):
         session_id = event.unified_msg_origin
         self.active_sessions.add(session_id)
         self.w_active_sessions.discard(session_id)
+        await self._persist_state()
         default_char = self.config.get("default_character")
         default_emotion = self.config.get("default_emotion_name")
         logger.info(f"会话 [{session_id}] 的 LLM TTS 功能已开启。")
@@ -688,6 +831,7 @@ class GenieTtsLlmPlugin(Star):
         session_id = event.unified_msg_origin
         self.active_sessions.discard(session_id)
         self.w_active_sessions.discard(session_id)
+        await self._persist_state()
         logger.info(f"会话 [{session_id}] 的所有 LLM TTS 功能已关闭。")
         yield event.plain_result("⏹️ 本对话的所有LLM语音合成功能已关闭。")
 
@@ -705,6 +849,7 @@ class GenieTtsLlmPlugin(Star):
 
         self.inactive_groups.discard(group_id)
         self.active_groups.add(group_id)
+        await self._persist_state()
         default_char = self.config.get("default_character")
         default_emotion = self.config.get("default_emotion_name")
 
@@ -730,10 +875,11 @@ class GenieTtsLlmPlugin(Star):
             yield event.plain_result("❌ 此指令仅限群聊使用。")
             return
 
-        if self.config.get("enable_group_tts_by_default", False):
-            self.inactive_groups.add(group_id)
-        else:
-            self.active_groups.discard(group_id)
+        # 必须同时记录"已手动关闭"并移出"已手动开启"：
+        # 否则白名单群 /ttg-q 之后一重启就会被白名单初始化重新打开。
+        self.inactive_groups.add(group_id)
+        self.active_groups.discard(group_id)
+        await self._persist_state()
         logger.info(f"群组 [{group_id}] 的 LLM TTS 功能已关闭。")
         yield event.plain_result("⏹️ 本群组的LLM语音合成已关闭。")
 
@@ -747,6 +893,7 @@ class GenieTtsLlmPlugin(Star):
         session_id = event.unified_msg_origin
         self.w_active_sessions.add(session_id)
         self.active_sessions.discard(session_id)
+        await self._persist_state()
         default_char = self.config.get("default_character")
         logger.info(f"会话 [{session_id}] 的 LLM 自动情感识别 TTS 功能已开启。")
         yield event.plain_result(
@@ -757,6 +904,7 @@ class GenieTtsLlmPlugin(Star):
     async def stop_tts_w(self, event: AstrMessageEvent):
         session_id = event.unified_msg_origin
         self.w_active_sessions.discard(session_id)
+        await self._persist_state()
         logger.info(f"会话 [{session_id}] 的 LLM 自动情感识别 TTS 功能已关闭。")
         yield event.plain_result("⏹️ 本对话的自动情感识别语音合成已关闭。")
 
@@ -769,6 +917,7 @@ class GenieTtsLlmPlugin(Star):
                 "character": character_name,
                 "emotion": emotion_name,
             }
+            await self._persist_state()
             logger.info(
                 f"会话 [{event.unified_msg_origin}] 切换感情至: {character_name} - {emotion_name}"
             )
@@ -786,6 +935,7 @@ class GenieTtsLlmPlugin(Star):
             self.session_w_settings[event.unified_msg_origin] = {
                 "character": character_name
             }
+            await self._persist_state()
             logger.info(
                 f"会话 [{event.unified_msg_origin}] 切换自动情感识别角色至: {character_name}"
             )
@@ -794,6 +944,149 @@ class GenieTtsLlmPlugin(Star):
             )
         else:
             yield event.plain_result(f"❌ 未找到角色 '{character_name}'。")
+
+    @filter.command("tts-status", alias={"语音状态"})
+    async def tts_status(self, event: AstrMessageEvent):
+        """查看本会话/本群的语音开关、当前音色、队列与 TTS 服务器状态"""
+        session_id = event.unified_msg_origin
+        group_id = self._normalize_group_id(event.message_obj.group_id)
+
+        if session_id in self.w_active_sessions:
+            session_state = "✅ 自动情感识别模式（/tts-w）"
+        elif session_id in self.active_sessions:
+            session_state = "✅ 固定情感模式（/tts-llm）"
+        else:
+            session_state = "⏹️ 未开启"
+
+        lines = ["🎙️ Genie TTS 状态", f"• 本会话: {session_state}"]
+
+        if group_id:
+            if self._is_group_blacklisted(group_id):
+                group_state = "⛔ 已被群黑名单禁用"
+            elif self._is_group_tts_active(group_id):
+                group_state = "✅ 已开启（全员生效）"
+            else:
+                group_state = "⏹️ 未开启"
+            lines.append(f"• 本群 [{group_id}]: {group_state}")
+
+        char_name, emotion_name, emotion_data = self._resolve_tts_profile(session_id)
+        if emotion_data:
+            lines.append(f"• 当前音色: {char_name} - {emotion_name}")
+        else:
+            lines.append(
+                "• 当前音色: ❌ 不可用（角色 "
+                + repr(char_name or "未设置")
+                + " / 情感 "
+                + repr(emotion_name or "未设置")
+                + "），请用 /查看感情 检查注册情况"
+            )
+
+        trigger_mode = str(self.config.get("tts_trigger_mode", "always"))
+        lines.append(f"• 触发模式: {trigger_mode}")
+        lines.append(f"• 自动回复输出: {self._get_auto_tts_output_mode()}")
+        lines.append(f"• 主动语音输出: {self._get_llm_tool_tts_output_mode()}")
+
+        stats = self.tts_engine.stats
+        lines.append(
+            "• 合成统计: 成功 %d / 失败 %d / 无朗读内容跳过 %d / 参考音频泄漏拦截 %d"
+            % (
+                stats.get("succeeded", 0),
+                stats.get("failed", 0),
+                stats.get("skipped_no_speech", 0),
+                stats.get("leak_guard_hits", 0),
+            )
+        )
+        lines.append(f"• 排队中的合成请求: {self.tts_engine.queue_size()}")
+
+        yield event.plain_result("\n".join(lines) + "\n\n🛰️ 正在探测 TTS 服务器…")
+
+        probes = await self.tts_engine.probe_servers()
+        if not probes:
+            yield event.plain_result(
+                "❌ 没有配置任何 TTS 服务器地址，请在插件配置的 tts_servers 里填写。"
+            )
+            return
+
+        probe_lines = ["🛰️ TTS 服务器"]
+        has_failure = False
+        for index, probe in enumerate(probes, start=1):
+            url = probe.get("url", "")
+            latency = probe.get("latency") or 0.0
+            if probe.get("ok"):
+                characters = list(probe.get("characters") or [])
+                busy_flag = "（正在合成中）" if probe.get("busy") else ""
+                preview = "、".join(characters[:6]) or "无"
+                if len(characters) > 6:
+                    preview += " …"
+                probe_lines.append(
+                    f"{index}. ✅ {url}{busy_flag}\n"
+                    f"   延迟 {latency:.2f}s | 可用角色 {len(characters)} 个: {preview}"
+                )
+            else:
+                has_failure = True
+                probe_lines.append(
+                    f"{index}. ❌ {url}\n   {probe.get('error') or '连接失败'}"
+                )
+
+        if has_failure:
+            probe_lines.append(
+                "提示: HuggingFace Space 休眠后首次唤醒需要 1~3 分钟，"
+                "可稍后重试，或在配置里开启 enable_space_keepalive 保活。"
+            )
+
+        yield event.plain_result("\n".join(probe_lines))
+
+    @filter.command("tts-again", alias={"重发语音"})
+    async def tts_again(self, event: AstrMessageEvent):
+        """重新发送本会话最近一条合成成功的语音，不重复消耗 TTS 算力"""
+        session_id = event.unified_msg_origin
+        if self._is_group_blacklisted(event.message_obj.group_id):
+            yield event.plain_result("❌ 本群组已被禁用语音合成功能。")
+            return
+
+        audio_path = self.last_audio_paths.get(session_id)
+        if not audio_path:
+            yield event.plain_result(
+                "本会话还没有生成过语音，先用 /合成 或开启 /tts-llm 让我说一句吧。"
+            )
+            return
+
+        if not os.path.exists(audio_path):
+            self.last_audio_paths.pop(session_id, None)
+            yield event.plain_result(
+                "最近一条语音的临时文件已被清理（临时音频默认只保留一段时间），请重新合成。"
+            )
+            return
+
+        yield event.chain_result([Comp.Record(file=audio_path)])
+        event.stop_event()
+
+    @filter.command("tts-help", alias={"语音帮助"})
+    async def tts_help(self, event: AstrMessageEvent):
+        """列出本插件的全部指令"""
+        yield event.plain_result(
+            "🎙️ Genie TTS 指令一览\n"
+            "【开关】\n"
+            "• /tts-llm（开启语音合成）本会话开启固定情感模式\n"
+            "• /tts-q（关闭语音合成）本会话关闭全部语音\n"
+            "• /tts-w（开启自动情感识别）由 AI 决定情感\n"
+            "• /tts-w-q（关闭自动情感识别）\n"
+            "• /ttg（开启群语音）本群全员生效\n"
+            "• /ttg-q（关闭群语音）\n"
+            "【音色】\n"
+            "• /sw 角色 感情（切换感情）\n"
+            "• /sw-w 角色（切换w角色）\n"
+            "• /查看感情 列出已注册角色与感情\n"
+            "• /注册感情 角色 感情 参考音频相对路径 参考文本 [语言]\n"
+            "• /删除感情 角色 感情\n"
+            "【合成】\n"
+            "• /合成 角色 感情 文本 手动合成一条语音\n"
+            "• /tts-again（重发语音）重发本会话最近一条语音\n"
+            "【诊断】\n"
+            "• /tts-status（语音状态）开关、音色、队列与服务器状态\n"
+            "• /tts-help（语音帮助）显示本帮助\n"
+            "开关与音色选择会自动持久化，重启 AstrBot 后不会丢。"
+        )
 
     @filter.llm_tool(name="genie_tts_speak")
     async def llm_tool_genie_tts_speak(
@@ -878,6 +1171,12 @@ class GenieTtsLlmPlugin(Star):
             if not tts_target_text:
                 return "语音发送失败：混合模式下用于 TTS 的文本准备失败了，请检查翻译配置或日志。"
 
+        if not has_pronounceable(tts_target_text):
+            return (
+                "语音发送失败：这段文本里没有任何可以朗读的字（只有标点或表情符号）。"
+                "请给出包含实际文字的内容再调用一次。"
+            )
+
         audio_path = await self.tts_engine.synthesize(
             character_name=char_name,
             ref_audio_path=emotion_data["ref_audio_path"],
@@ -888,6 +1187,7 @@ class GenieTtsLlmPlugin(Star):
         )
         if not audio_path:
             return "语音发送失败：TTS 合成没有成功，请检查服务状态或日志。"
+        self._remember_last_audio(session_id, audio_path)
 
         ok, error_message = await self._dispatch_llm_tool_tts_output(
             session_id=session_id,
@@ -1154,7 +1454,13 @@ class GenieTtsLlmPlugin(Star):
             logger.error(f"[{session_id}] 找不到感情配置: {char_name} - {emotion_name}")
             return None
 
-        return await self.tts_engine.synthesize(
+        # 整段没有可发音字符时直接放弃：Genie 的 t2s 对纯标点段会返回空音频，
+        # 旧版本甚至会把参考音频原样拼进结果里。
+        if not has_pronounceable(text):
+            logger.info(f"[{session_id}] 文本没有可朗读字符，已跳过合成: {text[:40]}")
+            return None
+
+        audio_path = await self.tts_engine.synthesize(
             character_name=char_name,
             ref_audio_path=emotion_data["ref_audio_path"],
             ref_audio_text=emotion_data["ref_audio_text"],
@@ -1162,6 +1468,7 @@ class GenieTtsLlmPlugin(Star):
             session_id_for_log=session_id,
             language=emotion_data.get("language"),
         )
+        return self._remember_last_audio(session_id, audio_path)
 
     @filter.on_llm_request()
     async def inject_llm_prompt(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -1283,9 +1590,13 @@ class GenieTtsLlmPlugin(Star):
             return
 
         # 0. 清理可能存在的幻觉报错 (防止LLM复读之前的错误提示)
-        original_text = original_text.replace("(TTS失败: 翻译无结果)", "")
-        original_text = original_text.replace("(TTS合成失败)", "")
-        original_text = original_text.replace("(TTS失败: 角色", "")  # 模糊匹配
+        #    整条正则匹配。旧实现用 "(TTS失败: 角色" 做模糊匹配，
+        #    会把 "'角色名'无效)" 这种残渣留在正文里发给用户。
+        cleaned_text = self.TTS_FAILURE_NOTICE_PATTERN.sub("", original_text).strip()
+        removed_failure_notice = cleaned_text != original_text
+        original_text = cleaned_text
+        if not original_text:
+            return
 
         configured_llm_emotion = self._should_inject_llm_emotion_tags()
         configured_llm_translation = self._should_inject_llm_translation_tags()
@@ -1296,7 +1607,9 @@ class GenieTtsLlmPlugin(Star):
                 strip_emotion=configured_llm_emotion or "[emotion=" in original_text,
             )
         )
-        if stripped_directives:
+        # 旧版本只在剥离了内部标签时才写回，导致被清理掉的幻觉失败提示
+        # 依然会原样发给用户；这里把清理结果一并写回可见回复。
+        if stripped_directives or removed_failure_notice:
             resp.completion_text = original_text.strip()
             resp.result_chain.chain = [Comp.Plain(resp.completion_text)]
 
@@ -1371,9 +1684,7 @@ class GenieTtsLlmPlugin(Star):
                 emotion_source = "会话固定情感" if session_setting else "默认情感"
 
         if not char_name or not self.emotion_manager.character_exists(char_name):
-            resp.result_chain.chain.append(
-                Comp.Plain(f"\n(TTS失败: 角色'{char_name}'无效)")
-            )
+            self._append_tts_failure_notice(resp, f"TTS失败: 角色'{char_name}'无效")
             return
 
         # 确定情感
@@ -1422,7 +1733,7 @@ class GenieTtsLlmPlugin(Star):
                     "已跳过语音合成并保留原文本回复。"
                 )
                 return
-            resp.result_chain.chain.append(Comp.Plain("\n(TTS失败: 翻译无结果)"))
+            self._append_tts_failure_notice(resp, "TTS失败: 翻译无结果")
             return
 
         display_text = original_text
@@ -1431,7 +1742,7 @@ class GenieTtsLlmPlugin(Star):
             display_text, output_mode
         )
         if not tts_source_text:
-            resp.result_chain.chain.append(Comp.Plain("\n(TTS失败: 没有可用于朗读的文本)"))
+            self._append_tts_failure_notice(resp, "TTS失败: 没有可用于朗读的文本")
             return
 
         if output_mode == "split_audio_text":
@@ -1450,7 +1761,7 @@ class GenieTtsLlmPlugin(Star):
                 target_text = tts_source_text
 
             if not target_text:
-                resp.result_chain.chain.append(Comp.Plain("\n(TTS失败: 混合模式翻译无结果)"))
+                self._append_tts_failure_notice(resp, "TTS失败: 混合模式翻译无结果")
                 return
 
         # 最终合成
@@ -1468,8 +1779,8 @@ class GenieTtsLlmPlugin(Star):
                 char_name, default_emotion
             )
             if not emotion_data:
-                resp.result_chain.chain.append(
-                    Comp.Plain(f"\n(TTS失败: 情感'{target_emotion}'无效)")
+                self._append_tts_failure_notice(
+                    resp, f"TTS失败: 情感'{target_emotion}'无效"
                 )
                 return
             target_emotion = default_emotion
@@ -1485,6 +1796,15 @@ class GenieTtsLlmPlugin(Star):
             f"参考音频: {emotion_data.get('ref_audio_path')}"
         )
 
+        # 整段都是标点/表情符号时不要送去合成：不仅浪费一次请求，
+        # 还会在正文后面挂一条毫无意义的"合成失败"。
+        if not has_pronounceable(target_text):
+            logger.info(
+                f"[{session_id}] 待合成文本没有可朗读字符，已跳过本轮自动TTS: "
+                f"{target_text[:40]}"
+            )
+            return
+
         # 合成语音
         audio_path = await self.tts_engine.synthesize(
             character_name=char_name,
@@ -1496,6 +1816,7 @@ class GenieTtsLlmPlugin(Star):
         )
 
         if audio_path:
+            self._remember_last_audio(session_id, audio_path)
             await self._apply_auto_tts_output_mode(
                 session_id=session_id,
                 resp=resp,
@@ -1505,7 +1826,7 @@ class GenieTtsLlmPlugin(Star):
                 output_mode=output_mode,
             )
         else:
-            resp.result_chain.chain.append(Comp.Plain("\n(TTS合成失败)"))
+            self._append_tts_failure_notice(resp, "TTS合成失败")
 
     @filter.on_decorating_result()
     async def sanitize_tts_directives_before_send(self, event: AstrMessageEvent):
@@ -1525,6 +1846,10 @@ class GenieTtsLlmPlugin(Star):
         self._keepalive_stop_event.set()
         if self._keepalive_task:
             await asyncio.gather(self._keepalive_task, return_exceptions=True)
+
+        if self._state_restore_task and not self._state_restore_task.done():
+            self._state_restore_task.cancel()
+            await asyncio.gather(self._state_restore_task, return_exceptions=True)
 
         await self.tts_engine.terminate()
         await self.http_client.aclose()
