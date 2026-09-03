@@ -175,6 +175,7 @@ function field(opts) {
   if (opts.desc) f.appendChild(h("p", { class: "field-desc", text: opts.desc }));
   append(f, opts.control);
   if (opts.hint) f.appendChild(h("p", { class: "field-hint", text: opts.hint }));
+  if (opts.hintNode) f.appendChild(opts.hintNode);  /* 需要随输入实时改写的提示行走这个口子 */
   return f;
 }
 
@@ -1615,33 +1616,140 @@ function savePackFrom(opts) {
 
 /* ---------- 变更报告 ---------- */
 
-function diffCol(kind, label, items, tone) {
+/* 五个桶（新增/更新/跳过/移除/无效）装的内容量差得极大：
+   一次导入里常见的形态是「4 个桶是空的、1 个桶 1 条」，也可能是
+   「added 39 条、每条带一串 reference_audio/xxx.ogg 长路径」。
+   所以这里不再画五个等宽固定列：
+     · 空桶不建列，收成底下一行灰色 pill（.diff-quiet）；
+     · 有内容的列按条目数分档（data-load=light/mid/heavy）抢宽度；
+     · 每条拆成「名字行 + 原因行 + 新旧值行」，长文本断行 + 两行截断 + title 兜全文；
+     · 超过 COLLAPSED_ROWS 条先折叠，展开后列内滚动，不让报告把整页顶飞。 */
+
+var COLLAPSED_ROWS = 10;
+
+var DIFF_FIELDS = [
+  ["ref_audio_path", "参考音频"],
+  ["ref_audio_text", "参考文本"],
+  ["language", "语言"]
+];
+
+function baseName(v) {
+  v = v === null || v === undefined ? "" : String(v);
+  var i = Math.max(v.lastIndexOf("/"), v.lastIndexOf("\\"));
+  return i >= 0 ? v.slice(i + 1) : v;
+}
+
+/* 老版本对 updated 只会写死一句「文本/语言有变」，或者把前后两条完整路径
+   各截 18 字 —— 参考音频全在 reference_audio/ 下，前缀一样，截完两边一模一样，
+   等于什么都没说。现在按字段逐个比，路径只比文件名，全文进 title。 */
+function diffDetail(before, after) {
+  before = before || {};
+  after = after || {};
+  var labels = [];
+  var pairs = [];
+  var full = [];
+  DIFF_FIELDS.forEach(function (f) {
+    var key = f[0];
+    var b = before[key] === null || before[key] === undefined ? "" : String(before[key]);
+    var a = after[key] === null || after[key] === undefined ? "" : String(after[key]);
+    if (b === a) return;
+    labels.push(f[1]);
+    var bs = key === "ref_audio_path" ? baseName(b) : b;
+    var as = key === "ref_audio_path" ? baseName(a) : a;
+    pairs.push(shorten(bs || "空", 26) + " → " + shorten(as || "空", 26));
+    full.push(f[1] + "：" + (b || "（空）") + "  →  " + (a || "（空）"));
+  });
+  if (!labels.length) return { why: "内容有变", pair: "", full: "" };
+  return { why: labels.join(" / ") + "有变", pair: pairs.join(" · "), full: full.join("\n") };
+}
+
+/* 一条条目里能给的信息，取决于它落在哪个桶：
+     added   —— 只有新值，写清楚这条新感情指向哪个参考音频；
+     removed —— 只有旧值，写清楚即将被清掉的是什么（replace 模式下最要紧）；
+     skipped —— 新旧都有但没采用，得说明「保留了现有值」并把被忽略的值摆出来，
+                 用户看到才知道要不要换成覆盖模式；
+     updated —— 新旧都有且已生效，逐字段给 旧 → 新；
+     invalid —— 只有 reason。 */
+function entryLine(entry) {
+  entry = entry || {};
+  var parts = [];
+  var file = baseName(entry.ref_audio_path);
+  if (file) parts.push(shorten(file, 30));
+  if (entry.language) parts.push(String(entry.language));
+  if (entry.ref_audio_text) parts.push("「" + shorten(String(entry.ref_audio_text), 16) + "」");
+  return parts.join(" · ");
+}
+
+function entryFull(entry) {
+  entry = entry || {};
+  return DIFF_FIELDS.map(function (f) {
+    var v = entry[f[0]];
+    return f[1] + "：" + (v === null || v === undefined || v === "" ? "（空）" : String(v));
+  }).join("\n");
+}
+
+function diffItem(it, kind) {
+  var name = String(it.character || "?") + " · " + String(it.emotion || "整个角色");
+  var li = h("li", { class: "diff-item" }, h("span", { class: "diff-name", title: name, text: name }));
+  var pair = "";
+  var pairTitle = "";
+  if (it.reason) {
+    var reason = String(it.reason);
+    li.appendChild(h("span", { class: "diff-why", title: reason, text: reason }));
+  } else if (kind === "skipped" && it.before && it.after) {
+    li.appendChild(h("span", { class: "diff-why", text: "已存在，保留现有值" }));
+    pair = "现有 " + (entryLine(it.before) || "空") + "  ｜  包内 " + (entryLine(it.after) || "空");
+    pairTitle = "现有\n" + entryFull(it.before) + "\n\n包内（未采用）\n" + entryFull(it.after);
+  } else if (it.before && it.after) {
+    var d = diffDetail(it.before, it.after);
+    li.appendChild(h("span", { class: "diff-why", title: d.full || d.why, text: d.why }));
+    pair = d.pair;
+    pairTitle = d.full || d.pair;
+  } else if (it.after || it.before) {
+    var one = it.after || it.before;
+    pair = entryLine(one);
+    pairTitle = entryFull(one);
+  }
+  if (pair) li.appendChild(h("span", { class: "diff-pair", title: pairTitle || pair, text: pair }));
+  return li;
+}
+
+function diffLoad(n) { return n >= 8 ? "heavy" : (n >= 3 ? "mid" : "light"); }
+
+function diffCol(kind, label, items) {
   items = items || [];
-  var col = h("div", { class: "diff-col", "data-kind": kind });
+  var col = h("div", { class: "diff-col", "data-kind": kind, "data-load": diffLoad(items.length) });
   col.appendChild(h("div", { class: "diff-head" }, [
     h("span", { text: label }),
     h("b", { text: String(items.length) })
   ]));
-  var list = h("ul", { class: "diff-list" });
+
+  var list = h("ul", { class: "diff-list", "data-open": "false" });
+  var rest = [];
   if (!items.length) {
-    list.appendChild(h("li", {}, dim("—")));
+    list.appendChild(h("li", { class: "diff-item" }, dim("—")));
   } else {
-    items.slice(0, 60).forEach(function (it) {
-      var li = h("li", {}, [
-        h("span", { text: (it.character || "?") + " · " + (it.emotion || "整个角色") })
-      ]);
-      if (it.reason) li.appendChild(h("span", { class: "diff-why", text: "  " + it.reason }));
-      else if (it.before && it.after) {
-        var b = String(it.before.ref_audio_path || "");
-        var a = String(it.after.ref_audio_path || "");
-        li.appendChild(h("span", { class: "diff-why", text: b === a ? "  文本/语言有变" : "  " + shorten(b, 18) + " → " + shorten(a, 18) }));
-      }
+    items.forEach(function (it, i) {
+      var li = diffItem(it, kind);
+      if (i >= COLLAPSED_ROWS) { li.hidden = true; rest.push(li); }
       list.appendChild(li);
     });
-    if (items.length > 60) list.appendChild(h("li", {}, dim("…还有 " + (items.length - 60) + " 条")));
   }
   col.appendChild(list);
-  if (tone) col.dataset.tone = tone;
+
+  if (rest.length) {
+    var open = false;
+    var more = btn("展开全部 " + items.length + " 条", {
+      sm: true, kind: "ghost", class: "diff-more",
+      onclick: function () {
+        open = !open;
+        for (var i = 0; i < rest.length; i++) rest[i].hidden = !open;
+        list.dataset.open = open ? "true" : "false";
+        more.textContent = open ? "只看前 " + COLLAPSED_ROWS + " 条" : "展开全部 " + items.length + " 条";
+      }
+    });
+    col.appendChild(more);
+  }
   return col;
 }
 
@@ -1665,6 +1773,33 @@ function reportCard(report, opts) {
     meta.note ? ["备注", String(meta.note)] : null
   ];
 
+  var buckets = [
+    ["added", "新增", report.added],
+    ["updated", "更新", report.updated],
+    ["skipped", "跳过", report.skipped],
+    ["removed", "移除", report.removed],
+    ["invalid", "无效", report.invalid]
+  ];
+  var diffBox = h("div", { class: "diff" });
+  var quiet = h("p", { class: "diff-quiet" });
+  var liveCount = 0;
+  var quietCount = 0;
+  buckets.forEach(function (b) {
+    var items = b[2] || [];
+    if (items.length) { liveCount += 1; diffBox.appendChild(diffCol(b[0], b[1], items)); return; }
+    quietCount += 1;
+    quiet.appendChild(h("i", { "data-kind": b[0], text: b[1] + " 0" }));
+  });
+  var diffZone = [];
+  if (liveCount) diffZone.push(diffBox);
+  if (quietCount) {
+    quiet.insertBefore(h("span", { text: liveCount ? "其余分类没有条目：" : "五个分类都没有条目，这份包对现有数据毫无影响：" }), quiet.firstChild);
+    diffZone.push(quiet);
+  }
+  if (c.unchanged) diffZone.push(h("p", { class: "diff-quiet" }, h("span", {
+    text: "另有 " + c.unchanged + " 条和现有数据完全一致，未列出。"
+  })));
+
   return card({
     sub: true,
     kicker: opts.kicker || "REPORT",
@@ -1681,13 +1816,7 @@ function reportCard(report, opts) {
       ]),
       head,
       kv(metaRows),
-      h("div", { class: "diff" }, [
-        diffCol("added", "新增", report.added),
-        diffCol("updated", "更新", report.updated),
-        diffCol("skipped", "跳过", report.skipped),
-        diffCol("removed", "移除", report.removed),
-        diffCol("invalid", "无效", report.invalid)
-      ])
+      diffZone
     ]
   });
 }
@@ -1903,11 +2032,46 @@ function renderPacks() {
   }));
 
   /* ===== 导入 ===== */
+  /* 这里以前是「oninput 只写 p.importText，不重渲染」：
+     结果粘完 JSON，试运行 / 执行导入 / 直接写入 / 清空内容 / 格式化 JSON 五个按钮
+     还是渲染时那份 disabled 状态，字数提示也一直停在「还是空的」，
+     非得再去点一下合并模式或试运行开关才活过来。
+     但整块重渲染会把 textarea 连焦点带光标一起换掉，所以按 syncCount 的老路子
+     只定点刷这几个节点。 */
+  var imChip = chip(p.fileName || "", "chip-mono chip-accent");
+  var imHint = h("p", { class: "field-hint" });
+  var imClear = btn("清空内容", { sm: true, kind: "ghost", onclick: function () { p.importText = ""; p.fileName = ""; p.report = null; renderPacks(); } });
+  var imFormat = btn("格式化 JSON", { sm: true, kind: "ghost", onclick: function () {
+    try {
+      p.importText = JSON.stringify(JSON.parse(String(p.importText)), null, 2);
+      renderPacks();
+      toast("已格式化", "ok", 1800);
+    } catch (e) { toast("这不是合法 JSON：" + (e && e.message ? e.message : String(e)), "danger"); }
+  } });
+  var imRun = btn(p.busy ? "处理中…" : (p.dry ? "试运行" : "执行导入"), {
+    kind: p.dry ? "soft" : "primary",
+    onclick: function () { runImport(p.dry); }
+  });
+  var imWrite = p.dry ? btn("直接写入", { kind: "primary", onclick: function () { runImport(false); } }) : null;
+
+  function syncImport() {
+    var raw = String(p.importText || "");
+    var has = !!raw.trim();
+    imHint.textContent = raw.length ? fmtBytes(raw.length) + " · " + raw.length + " 字符" : "还是空的";
+    imChip.textContent = p.fileName || "";
+    imChip.hidden = !p.fileName;
+    imClear.disabled = !raw.length;
+    imFormat.disabled = !raw.length;
+    imRun.disabled = !!p.busy || !has;
+    if (imWrite) imWrite.disabled = !!p.busy || !has;
+  }
+
   var ta = textarea(p.importText, null, {
     mono: true, rows: 9,
     placeholder: "把感情包 JSON 粘在这里，也可以直接粘裸 emotions.json（{角色:{感情:{...}}}）",
-    oninput: function (e) { p.importText = e.target.value; if (p.fileName) { p.fileName = ""; } }
+    oninput: function (e) { p.importText = e.target.value; if (p.fileName) { p.fileName = ""; } syncImport(); }
   });
+  syncImport();
 
   var zone = dropZone(function (text, name) {
     p.importText = text;
@@ -1920,32 +2084,19 @@ function renderPacks() {
   var imBody = [
     h("div", { class: "io-panel" }, [
       h("div", {}, [
-        field({ label: "感情包内容", tag: p.fileName ? chip(p.fileName, "chip-mono chip-accent") : null, control: ta, hint: String(p.importText || "").length ? fmtBytes(String(p.importText).length) + " · " + String(p.importText).length + " 字符" : "还是空的" })
+        field({ label: "感情包内容", tag: imChip, control: ta, hintNode: imHint })
       ]),
       h("div", {}, [
         field({ label: "从文件读入", control: zone }),
-        h("div", { class: "btnrow" }, [
-          btn("清空内容", { sm: true, kind: "ghost", disabled: !String(p.importText || "").length, onclick: function () { p.importText = ""; p.fileName = ""; p.report = null; renderPacks(); } }),
-          btn("格式化 JSON", { sm: true, kind: "ghost", disabled: !String(p.importText || "").length, onclick: function () {
-            try {
-              p.importText = JSON.stringify(JSON.parse(String(p.importText)), null, 2);
-              renderPacks();
-              toast("已格式化", "ok", 1800);
-            } catch (e) { toast("这不是合法 JSON：" + (e && e.message ? e.message : String(e)), "danger"); }
-          } })
-        ])
+        h("div", { class: "btnrow" }, [imClear, imFormat])
       ])
     ]),
     field({ label: "合并模式", control: segment(importModeOptions(), p.mode, function (val) { p.mode = val; renderPacks(); }) }),
     modeHint(p.mode),
     field({ label: "试运行", control: switchBox(p.dry, "只算差异，不写 emotions.json", function (e) { p.dry = e.target.checked; renderPacks(); }) }),
     h("div", { class: "btnrow" }, [
-      btn(p.busy ? "处理中…" : (p.dry ? "试运行" : "执行导入"), {
-        kind: p.dry ? "soft" : "primary",
-        disabled: !!p.busy || !String(p.importText || "").trim(),
-        onclick: function () { runImport(p.dry); }
-      }),
-      p.dry ? btn("直接写入", { kind: "primary", disabled: !!p.busy || !String(p.importText || "").trim(), onclick: function () { runImport(false); } }) : null,
+      imRun,
+      imWrite,
       btn("先存一份当前快照", { kind: "ghost", onclick: function () { savePackFrom({ note: "导入前自动备份" }); } })
     ].filter(Boolean))
   ];

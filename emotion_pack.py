@@ -383,8 +383,13 @@ def compute_import(
         for character, emotions in current.items():
             for emotion in emotions:
                 if emotion not in incoming.get(character, {}):
+                    # 带上即将被清掉的原值，UI/摘要才能告诉用户丢的是哪条参考音频
                     report["removed"].append(
-                        {"character": character, "emotion": emotion}
+                        {
+                            "character": character,
+                            "emotion": emotion,
+                            "before": dict(emotions.get(emotion) or {}),
+                        }
                     )
     else:
         merged = {name: dict(emotions) for name, emotions in current.items()}
@@ -395,6 +400,9 @@ def compute_import(
             item = {"character": character, "emotion": emotion}
             if existing is None:
                 merged.setdefault(character, {})[emotion] = dict(entry)
+                # 新增/跳过也带上具体条目：只报「角色 · 感情」的话，
+                # 一次导入 39 条时用户根本看不出每条指向哪个参考音频
+                item["after"] = dict(entry)
                 report["added"].append(item)
                 continue
             if _entries_equal(existing, entry):
@@ -403,6 +411,8 @@ def compute_import(
                 continue
             if mode == "merge":
                 merged.setdefault(character, {})[emotion] = dict(existing)
+                item["before"] = dict(existing)
+                item["after"] = dict(entry)
                 report["skipped"].append(item)
                 continue
             merged.setdefault(character, {})[emotion] = dict(entry)

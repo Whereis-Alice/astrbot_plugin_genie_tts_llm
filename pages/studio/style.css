@@ -570,8 +570,16 @@ html[data-density="compact"] .vn-text { min-height: 118px; font-size: 14.5px; li
 .drop b { display: block; font-size: 13px; color: var(--text); }
 .drop input[type="file"] { display: none; }
 
-.diff { display: grid; gap: var(--gap-sm); grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
-.diff-col { padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--panel-3); }
+/* 变更报告。五个桶的内容量差得极大 —— 可能全是「—」，也可能一个桶塞 39 条
+   带 reference_audio/xxx.ogg 长路径的条目。等宽固定列在这两头都难看：
+   空列白占一大片，满列被挤成一条一条截断的省略号。
+   所以：空桶不建列（JS 里收成 .diff-quiet 一行），有内容的列按条目数分档抢宽度，
+   条目内部竖着排三行，长文本 anywhere 断行 + 两行截断，全文靠 title。 */
+.diff { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--gap-sm); }
+.diff-col { flex: 1 1 200px; min-width: 0; display: flex; flex-direction: column;
+  padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--panel-3); }
+.diff-col[data-load="mid"] { flex: 1.7 1 260px; }
+.diff-col[data-load="heavy"] { flex: 2.6 1 320px; }
 .diff-col[data-kind="added"] { border-left: 3px solid var(--ok); }
 .diff-col[data-kind="updated"] { border-left: 3px solid var(--accent); }
 .diff-col[data-kind="skipped"] { border-left: 3px solid var(--warn); }
@@ -581,11 +589,25 @@ html[data-density="compact"] .vn-text { min-height: 118px; font-size: 14.5px; li
   font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase;
   color: var(--text-mute); }
 .diff-head b { font-family: var(--font-sans); font-size: 15px; letter-spacing: 0; color: var(--text); }
-.diff-list { margin: 7px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 3px;
-  max-height: 168px; overflow-y: auto; }
-.diff-list li { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.diff-list { margin: 7px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 3px; }
+.diff-list[data-open="true"] { max-height: 46vh; overflow-y: auto; padding-right: 4px; }
+.diff-list li { min-width: 0; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+  overflow-wrap: anywhere; word-break: break-word; }
 .diff-list li .diff-why { color: var(--warn); }
+.diff-col[data-kind="updated"] .diff-why { color: var(--accent); }
+.diff-col[data-kind="added"] .diff-pair, .diff-col[data-kind="removed"] .diff-pair { color: var(--text-dim); }
+.diff-item { display: flex; flex-direction: column; gap: 1px; padding-top: 4px; border-top: 1px solid var(--line); }
+.diff-item:first-child { padding-top: 0; border-top: 0; }
+.diff-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.diff-item .diff-why { display: block; font-family: var(--font-sans); font-size: 11px; line-height: 1.45; }
+.diff-pair { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  overflow: hidden; font-size: 10.5px; line-height: 1.45; color: var(--text-mute); }
+.diff-more { margin-top: 8px; align-self: flex-start; }
+.diff-quiet { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 7px;
+  margin: var(--gap-sm) 0 0; font-size: 11.5px; color: var(--text-mute); }
+.diff-quiet i { font-style: normal; font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .04em;
+  padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px; color: var(--text-dim); }
+.diff-quiet i[data-kind="invalid"], .diff-quiet i[data-kind="removed"] { border-color: var(--line-strong); }
 
 .pack-list { display: flex; flex-direction: column; gap: var(--gap-sm); }
 .pack { display: flex; flex-wrap: wrap; align-items: center; gap: var(--gap-sm);
