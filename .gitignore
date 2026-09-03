@@ -3,6 +3,8 @@ __pycache__/
 *.egg-info/
 .venv/
 temp_audio/
+data/
+emotion_packs/
 *.wav
 .idea/
 .vscode/

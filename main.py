@@ -4,6 +4,7 @@ import os
 import random
 import re
 import time
+from pathlib import Path
 from typing import Dict, Optional, Set, Tuple
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
@@ -13,6 +14,8 @@ import astrbot.api.message_components as Comp
 from astrbot.api.provider import LLMResponse, ProviderRequest
 
 # 从新模块导入功能
+from . import emotion_pack
+from .emotion_pack import EmotionPackError
 from .emotion_manager import EmotionManager
 from .tts_engine import TTSEngine, has_pronounceable
 from .external_apis import translate_text
@@ -22,12 +25,35 @@ from .external_apis import translate_text
     "astrbot_plugin_genie_tts_llm",
     "Whereis-Alice",
     "一个通过 LLM、翻译和 Genie TTS 实现语音合成的插件，支持主动语音工具",
-    "1.8.1",
+    "1.9.0",
     "https://github.com/Whereis-Alice/astrbot_plugin_genie_tts_llm",
 )
 class GenieTtsLlmPlugin(Star):
     # 会话开关/音色选择的持久化键。AstrBot 的插件 KV 存储按 plugin_id 隔离。
     STATE_KV_KEY = "session_state_v1"
+    # 插件版本号：WebUI 总览与感情包元数据都会读它。
+    PLUGIN_VERSION = "1.9.0"
+    # 感情包快照目录名（位于插件数据目录下）。
+    PACK_DIR_NAME = "emotion_packs"
+    # 能被识别为「导入模式」的 token，真正的语义交给 emotion_pack 归一化。
+    PACK_MODE_TOKENS = frozenset(
+        {
+            "merge",
+            "overwrite",
+            "replace",
+            "skip",
+            "update",
+            "force",
+            "合并",
+            "覆盖",
+            "替换",
+            "清空",
+        }
+    )
+    # 只预演不落盘的关键字。
+    PACK_DRY_TOKENS = frozenset(
+        {"试运行", "预演", "预览", "dry", "dryrun", "dry-run", "-n", "--dry-run"}
+    )
     # 最多记住多少个会话的"最近一条语音"，避免长期运行后字典无限增长。
     MAX_REMEMBERED_AUDIO = 200
     # 清理 LLM 复读的历史 TTS 失败提示。整条匹配，不留残渣。
@@ -59,8 +85,12 @@ class GenieTtsLlmPlugin(Star):
 
         # 初始化辅助模块
         plugin_data_dir = StarTools.get_data_dir("astrbot_plugin_genie_tts_llm")
+        # WebUI 工作台与感情包指令都要用到数据目录，存成属性方便复用。
+        self.plugin_data_dir = plugin_data_dir
         emotions_file_path = plugin_data_dir / "emotions.json"
         self.emotion_manager = EmotionManager(emotions_file_path)
+        # 感情库整体写盘要串行：WebUI 与聊天指令可能并发提交。
+        self._emotion_write_lock = asyncio.Lock()
 
         self.http_client = httpx.AsyncClient(timeout=300.0)
         self.tts_engine = TTSEngine(self.config, self.http_client, plugin_data_dir)
@@ -81,6 +111,18 @@ class GenieTtsLlmPlugin(Star):
 
         # KV 读取是协程，__init__ 里只能挂后台任务；恢复完成后置位 _state_restored。
         self._state_restore_task = asyncio.create_task(self._restore_state())
+
+        # 注册 WebUI 语音合成工作台。注册失败只记日志，不影响插件主流程。
+        self.web_api = None
+        try:
+            from .web_api import GenieWebApi
+
+            self.web_api = GenieWebApi(self)
+            # register() 内部已经打过日志，这里只兜住异常。
+            self.web_api.register(context)
+        except Exception as exc:
+            self.web_api = None
+            logger.error(f"Genie TTS: WebUI 工作台注册失败: {exc}")
 
         logger.info("LLM TTS 插件已加载。")
 
@@ -745,24 +787,518 @@ class GenieTtsLlmPlugin(Star):
             yield event.plain_result("❌ 保存文件时发生错误，删除失败。")
 
     @filter.command("查看感情")
-    async def view_emotions_command(self, event: AstrMessageEvent):
-        """查看所有已注册的感情"""
+    async def view_emotions_command(
+        self, event: AstrMessageEvent, character_name: str = ""
+    ):
+        """查看已注册的感情，可选只看某一个角色"""
         emotions_data = self.emotion_manager.emotions_data
         if not emotions_data:
             yield event.plain_result("当前未注册任何感情。")
             return
 
-        formatted_lines = ["所有已注册的感情列表："]
-        for character, emotions in emotions_data.items():
+        wanted = (character_name or "").strip()
+        if wanted:
+            if wanted not in emotions_data:
+                available = "、".join(str(name) for name in list(emotions_data)[:20])
+                yield event.plain_result(
+                    f"❌ 未找到角色 {wanted}。\n已注册角色: {available}"
+                )
+                return
+            items = [(wanted, emotions_data.get(wanted) or {})]
+            formatted_lines = [f"角色 {wanted} 的感情列表："]
+        else:
+            items = list(emotions_data.items())
+            formatted_lines = ["所有已注册的感情列表："]
+
+        total = 0
+        for character, emotions in items:
             formatted_lines.append(f"\n角色: {character}")
-            if emotions:
+            if isinstance(emotions, dict) and emotions:
                 for emotion_name in emotions.keys():
                     formatted_lines.append(f"  - {emotion_name}")
+                    total += 1
             else:
                 formatted_lines.append("  (暂无感情)")
 
-        final_message = "\n".join(formatted_lines)
-        yield event.plain_result(final_message)
+        formatted_lines.append(f"\n共 {len(items)} 个角色 / {total} 条感情。")
+        formatted_lines.append("导出用 /感情导出，导入用 /感情导入，快照用 /感情包。")
+        yield event.plain_result("\n".join(formatted_lines))
+
+    # --------------------------------------------------- 感情包（导入导出）
+
+    def _pack_dir(self) -> Path:
+        """感情包快照目录，惰性创建。WebUI 与指令共用同一个目录。"""
+        base = Path(getattr(self, "plugin_data_dir", ".")) / self.PACK_DIR_NAME
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+
+    def _clean_emotion_characters(self) -> Tuple[Dict, list]:
+        """返回通过校验的感情数据，以及被判定不合法的记录说明。"""
+        try:
+            return emotion_pack.normalize_characters(self.emotion_manager.emotions_data)
+        except EmotionPackError as exc:
+            logger.error(f"Genie TTS: 感情库整体不可解析: {exc}")
+            return {}, []
+
+    async def _commit_emotion_characters(self, characters: Dict) -> bool:
+        """整体写回 emotions.json；失败时回滚到磁盘上的旧值。"""
+        async with self._emotion_write_lock:
+            manager = self.emotion_manager
+            manager.emotions_data = characters
+            ok = False
+            try:
+                ok = bool(manager._save_emotions_to_file())
+            except Exception as exc:
+                logger.error(f"Genie TTS: 写入 emotions.json 异常: {exc}")
+                ok = False
+            if not ok:
+                try:
+                    manager.reload()
+                except Exception:
+                    pass
+            return ok
+
+    @staticmethod
+    def _strip_command_prefix(message_str: str, names: Tuple[str, ...]) -> str:
+        """去掉指令名，把剩下的整段原文交还调用方当 JSON 载荷。
+
+        AstrBot 的指令过滤器只会把消息切成 token 塞进声明的形参，多余的会被
+        丢掉；感情包 JSON 里全是空格和花括号，只能自己从原文里切。
+
+        注意：这里**不能**把空白压成一行。感情包常常裹在 Markdown 代码块里，
+        压掉换行后 "\u0060\u0060\u0060json" 会和 JSON 正文粘成一行，围栏就剥不掉了。
+        """
+        text = (message_str or "").strip().lstrip("\ufeff").strip()
+        if not text:
+            return ""
+        for name in names:
+            for prefix in (name, "/" + name, "!" + name, "！" + name, "#" + name):
+                if not text.startswith(prefix):
+                    continue
+                rest = text[len(prefix):]
+                if not rest:
+                    return ""
+                if rest[0].isspace():
+                    return rest.strip()
+        return text
+
+    def _split_pack_args(self, raw: str) -> Tuple[str, bool, str]:
+        """从指令尾巴里解析出 (模式, 是否试运行, 剩余载荷)。
+
+        只从头部最多吃两个 token，避免把 JSON 正文误当成参数；一个不认识但
+        明显是「想写模式却写错了」的 token 也会被吃掉，好让上层报出清晰的
+        模式错误，而不是让它混进 JSON 里变成难懂的解析失败。
+        """
+        text = (raw or "").strip()
+        mode = ""
+        dry = False
+        for _round in range(2):
+            if not text:
+                break
+            # 载荷可能从下一行才开始，所以按任意空白切，而不是只切空格。
+            head_match = re.match(r"(\S+)\s*", text)
+            if not head_match:
+                break
+            token = head_match.group(1)
+            rest = text[head_match.end():].strip()
+            lowered = token.lower()
+            if not mode and (
+                lowered in self.PACK_MODE_TOKENS or token in self.PACK_MODE_TOKENS
+            ):
+                mode = token
+                text = rest
+                continue
+            if not dry and lowered in self.PACK_DRY_TOKENS:
+                dry = True
+                text = rest
+                continue
+            if (
+                not mode
+                and len(token) <= 24
+                and not self._looks_like_pack_text(token)
+                and (not rest or self._looks_like_pack_text(rest))
+            ):
+                # 写错的模式词，交给 normalize_import_mode 报「模式只能是…」
+                mode = token
+                text = rest
+                continue
+            break
+        return mode, dry, text
+
+    @staticmethod
+    def _looks_like_pack_text(text: str) -> bool:
+        """粗判一段文本是不是感情包 JSON（裸对象或 Markdown 代码块）。"""
+        stripped = (text or "").strip().lstrip("\ufeff").strip()
+        if not stripped:
+            return False
+        return stripped.startswith("{") or stripped.startswith("\u0060\u0060\u0060")
+
+    async def _pack_text_from_event(
+        self, event: AstrMessageEvent, inline_text: str
+    ) -> Tuple[str, str]:
+        """按 消息正文 > 引用消息 > 上传附件 的优先级找出感情包内容。"""
+        inline = (inline_text or "").strip()
+        if self._looks_like_pack_text(inline):
+            return inline, "消息正文"
+
+        try:
+            components = list(event.get_messages() or [])
+        except Exception:
+            components = []
+
+        for comp in components:
+            if not isinstance(comp, Comp.Reply):
+                continue
+            quoted = (getattr(comp, "message_str", "") or "").strip()
+            if not quoted:
+                pieces = []
+                for sub in getattr(comp, "chain", None) or []:
+                    if isinstance(sub, Comp.Plain):
+                        pieces.append(getattr(sub, "text", "") or "")
+                quoted = "".join(pieces).strip()
+            if quoted:
+                return quoted, "引用消息"
+
+        for comp in components:
+            if not isinstance(comp, Comp.File):
+                continue
+            try:
+                local_path = await comp.get_file()
+            except Exception as exc:
+                logger.warning(f"Genie TTS: 获取感情包附件失败: {exc}")
+                continue
+            if not local_path or not os.path.isfile(local_path):
+                continue
+            try:
+                with open(local_path, "r", encoding="utf-8-sig") as handle:
+                    content = handle.read(emotion_pack.MAX_PACK_BYTES + 1)
+            except Exception as exc:
+                logger.warning(f"Genie TTS: 读取感情包附件失败: {exc}")
+                continue
+            if content.strip():
+                name = getattr(comp, "name", "") or os.path.basename(local_path)
+                return content, f"附件 {name}"
+
+        return inline, "消息正文"
+
+    async def _apply_pack_import(
+        self, incoming: Dict, mode: str, dry: bool, invalid: Optional[list] = None
+    ) -> Tuple[Dict, str]:
+        """算出合并结果并按需落盘，返回 (变更报告, 可直接回显的摘要)。"""
+        current, _current_invalid = self._clean_emotion_characters()
+        merged, report = emotion_pack.compute_import(current, incoming, mode, invalid)
+        summary = emotion_pack.describe_report(report)
+        if dry:
+            return report, summary + "\n\n🧪 试运行结束，未写入。去掉「试运行」即真正导入。"
+        if not report.get("changed"):
+            return report, summary + "\n\n没有需要写入的变化，emotions.json 保持原样。"
+        if not await self._commit_emotion_characters(merged):
+            return report, summary + "\n\n❌ 写入 emotions.json 失败，已回滚到旧数据。"
+        return report, summary + "\n\n✅ 已写入 emotions.json，立即生效，无需重启。"
+
+    @filter.command("感情导出", alias={"导出感情"})
+    async def export_emotions_command(
+        self, event: AstrMessageEvent, character_name: str = ""
+    ):
+        """导出感情包 JSON；省略角色名则导出全部角色"""
+        characters, invalid = self._clean_emotion_characters()
+        if not characters:
+            yield event.plain_result(
+                "当前没有可导出的感情。先用 /注册感情 或 WebUI 工作台添加几条。"
+            )
+            return
+
+        wanted = (character_name or "").strip()
+        if wanted:
+            picked = emotion_pack.select_characters(characters, [wanted], None)
+            if not picked:
+                available = "、".join(list(characters)[:20])
+                yield event.plain_result(f"❌ 未找到角色 {wanted}。\n可导出: {available}")
+                return
+        else:
+            picked = characters
+
+        pack = emotion_pack.build_pack(
+            picked, plugin_version=self.PLUGIN_VERSION, source="command"
+        )
+        text = emotion_pack.dumps_pack(pack)
+        filename = emotion_pack.default_pack_filename(picked)
+
+        target = None
+        try:
+            target = self._pack_dir() / filename
+            target.write_text(text, encoding="utf-8")
+            saved_hint = f"服务端快照: {filename}"
+        except Exception as exc:
+            logger.error(f"Genie TTS: 保存感情包快照失败: {exc}")
+            target = None
+            saved_hint = f"⚠ 服务端快照保存失败: {exc}"
+
+        counts = emotion_pack.summarize(picked)
+        char_count = counts.get("characters", 0)
+        emotion_count = counts.get("emotions", 0)
+        size_kb = max(1, len(text.encode("utf-8")) // 1024)
+        scope_label = wanted or "全部角色"
+        summary = [
+            "📦 感情包已导出",
+            f"范围: {scope_label}",
+            f"内容: {char_count} 个角色 / {emotion_count} 条感情（约 {size_kb}KB）",
+            saved_hint,
+        ]
+        if invalid:
+            summary.append(f"⚠ 跳过 {len(invalid)} 条不合法记录，可在 WebUI 工作台里修。")
+        summary.append(f"恢复: /感情包恢复 {filename} [模式] [试运行]")
+        summary.append("也可以在 WebUI 工作台「感情包」页直接下载 .json。")
+        yield event.plain_result("\n".join(summary))
+
+        # QQ 侧才有文件消息段；发失败不影响上面的摘要与快照。
+        if target is not None and event.get_platform_name() == "aiocqhttp":
+            try:
+                await event.send(
+                    MessageChain(chain=[Comp.File(name=filename, file=str(target))])
+                )
+            except Exception as exc:
+                logger.warning(f"Genie TTS: 感情包文件发送失败: {exc}")
+
+        # 短包直接贴原文，方便复制到别处；/感情导入 能自动剥掉代码围栏。
+        fence = "\u0060\u0060\u0060"
+        if len(text) <= 1800:
+            yield event.plain_result(fence + "json\n" + text + "\n" + fence)
+        else:
+            yield event.plain_result(
+                "JSON 超过 1800 字就不贴原文了，请用上面的快照文件或 WebUI 下载。"
+            )
+
+    @filter.command("感情导入", alias={"导入感情"})
+    async def import_emotions_command(self, event: AstrMessageEvent, mode: str = ""):
+        """导入感情包：正文附 JSON、引用含 JSON 的消息，或上传 .json 附件"""
+        raw_tail = self._strip_command_prefix(
+            event.get_message_str(), ("感情导入", "导入感情")
+        )
+        parsed_mode, dry, payload = self._split_pack_args(raw_tail)
+        chosen_mode = parsed_mode
+        if not chosen_mode:
+            # 过滤器会把正文的第一个 token 塞进声明的形参，那可能是 "{" 或者
+            # 代码围栏，只有确实是模式词/试运行词时才采信。
+            hint = (mode or "").strip()
+            lowered = hint.lower()
+            if lowered in self.PACK_MODE_TOKENS or hint in self.PACK_MODE_TOKENS:
+                chosen_mode = hint
+            elif lowered in self.PACK_DRY_TOKENS:
+                dry = True
+
+        text, origin = await self._pack_text_from_event(event, payload)
+        if not (text or "").strip():
+            yield event.plain_result(self._pack_import_usage())
+            return
+
+        try:
+            incoming, meta, invalid_incoming = emotion_pack.loads_pack(text)
+        except EmotionPackError as exc:
+            yield event.plain_result(f"❌ 感情包解析失败（来源: {origin}）：{exc}")
+            return
+        except Exception as exc:
+            yield event.plain_result(f"❌ 感情包解析异常（来源: {origin}）：{exc}")
+            return
+
+        if not incoming:
+            reason = f"，其中 {len(invalid_incoming)} 条不合法" if invalid_incoming else ""
+            yield event.plain_result(
+                f"❌ 感情包里没有任何可用记录（来源: {origin}）{reason}。"
+            )
+            return
+
+        try:
+            _report, tail = await self._apply_pack_import(
+                incoming, chosen_mode, dry, invalid_incoming
+            )
+        except EmotionPackError as exc:
+            yield event.plain_result(f"❌ {exc}")
+            return
+
+        title = "📥 感情包导入（试运行）" if dry else "📥 感情包导入"
+        head = [title, f"来源: {origin}"]
+        note = str((meta or {}).get("note") or "").strip()
+        if note:
+            head.append(f"备注: {note[:120]}")
+        source_tag = str((meta or {}).get("source") or "").strip()
+        if source_tag:
+            head.append(f"来源标记: {source_tag[:60]}")
+        yield event.plain_result("\n".join(head) + "\n" + tail)
+
+    @staticmethod
+    def _pack_import_usage() -> str:
+        fence = "\u0060\u0060\u0060"
+        return (
+            "❌ 没找到感情包内容。三种用法：\n"
+            "1) 直接贴 JSON：/感情导入 merge {...}\n"
+            "2) 引用一条含 JSON 的消息，再发 /感情导入\n"
+            "3) 上传 .json 文件，在同一条消息里写 /感情导入\n"
+            "模式：merge 只补新（默认）/ overwrite 冲突覆盖 / replace 先清空\n"
+            "加「试运行」只预演不写盘，例如 /感情导入 overwrite 试运行\n"
+            "JSON 可以是 /感情导出 的完整包，也可以是裸的 emotions.json；"
+            "包在 " + fence + " 代码块里也能识别。"
+        )
+
+    @filter.command("感情包", alias={"感情包列表"})
+    async def list_emotion_packs_command(self, event: AstrMessageEvent):
+        """列出服务端保存的感情包快照"""
+        try:
+            base = self._pack_dir()
+            entries = sorted(
+                (
+                    item
+                    for item in base.iterdir()
+                    if item.is_file() and item.suffix.lower() == ".json"
+                ),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+        except Exception as exc:
+            yield event.plain_result(f"❌ 读取快照目录失败：{exc}")
+            return
+
+        if not entries:
+            yield event.plain_result(
+                "还没有任何感情包快照。\n"
+                "用 /感情包保存 [文件名] 存一份，/感情导出 也会自动入库。"
+            )
+            return
+
+        lines = [f"📦 感情包快照（共 {len(entries)} 份，按时间倒序）"]
+        for item in entries[:20]:
+            try:
+                stat = item.stat()
+                stamp = time.strftime("%m-%d %H:%M", time.localtime(stat.st_mtime))
+                size_kb = max(1, stat.st_size // 1024)
+            except Exception:
+                stamp = "??"
+                size_kb = 0
+            try:
+                pack_chars, _meta, _invalid = emotion_pack.loads_pack(
+                    item.read_text(encoding="utf-8-sig")
+                )
+                counts = emotion_pack.summarize(pack_chars)
+                char_count = counts.get("characters", 0)
+                emotion_count = counts.get("emotions", 0)
+                detail = f"{char_count} 角色 / {emotion_count} 感情"
+            except Exception:
+                detail = "⚠ 解析失败"
+            lines.append(f"• {item.name}\n  {detail} · {size_kb}KB · {stamp}")
+
+        if len(entries) > 20:
+            lines.append(f"…另有 {len(entries) - 20} 份未列出。")
+        lines.append("恢复: /感情包恢复 文件名 [模式] [试运行]")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("感情包保存")
+    async def save_emotion_pack_command(
+        self, event: AstrMessageEvent, filename: str = ""
+    ):
+        """把当前感情库存成一份服务端快照"""
+        characters, invalid = self._clean_emotion_characters()
+        if not characters:
+            yield event.plain_result("当前没有可保存的感情。")
+            return
+
+        name = (filename or "").strip()
+        target_name = (
+            emotion_pack.safe_pack_filename(name)
+            if name
+            else emotion_pack.default_pack_filename(characters)
+        )
+        try:
+            target = self._pack_dir() / target_name
+        except Exception as exc:
+            yield event.plain_result(f"❌ 无法访问快照目录：{exc}")
+            return
+
+        if target.exists():
+            yield event.plain_result(
+                f"❌ 快照 {target_name} 已存在。换个文件名，或在 WebUI 里先删掉旧的。"
+            )
+            return
+
+        pack = emotion_pack.build_pack(
+            characters, plugin_version=self.PLUGIN_VERSION, source="command"
+        )
+        try:
+            target.write_text(emotion_pack.dumps_pack(pack), encoding="utf-8")
+        except Exception as exc:
+            yield event.plain_result(f"❌ 写入快照失败：{exc}")
+            return
+
+        counts = emotion_pack.summarize(characters)
+        char_count = counts.get("characters", 0)
+        emotion_count = counts.get("emotions", 0)
+        lines = [
+            f"✅ 已保存快照 {target_name}",
+            f"{char_count} 个角色 / {emotion_count} 条感情",
+        ]
+        if invalid:
+            lines.append(f"⚠ 跳过 {len(invalid)} 条不合法记录。")
+        lines.append(f"恢复: /感情包恢复 {target_name}")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("感情包恢复")
+    async def restore_emotion_pack_command(
+        self,
+        event: AstrMessageEvent,
+        filename: str,
+        mode: str = "merge",
+        option: str = "",
+    ):
+        """从服务端快照恢复感情库"""
+        target_name = emotion_pack.safe_pack_filename(filename)
+        try:
+            target = self._pack_dir() / target_name
+        except Exception as exc:
+            yield event.plain_result(f"❌ 无法访问快照目录：{exc}")
+            return
+
+        if not target.is_file():
+            yield event.plain_result(
+                f"❌ 找不到快照 {target_name}。用 /感情包 看看有哪些。"
+            )
+            return
+
+        tokens = [str(mode or "").strip(), str(option or "").strip()]
+        dry = any(token.lower() in self.PACK_DRY_TOKENS for token in tokens if token)
+        chosen_mode = ""
+        for token in tokens:
+            if token and token.lower() not in self.PACK_DRY_TOKENS:
+                chosen_mode = token
+                break
+
+        try:
+            incoming, meta, invalid_incoming = emotion_pack.loads_pack(
+                target.read_text(encoding="utf-8-sig")
+            )
+        except EmotionPackError as exc:
+            yield event.plain_result(f"❌ 快照 {target_name} 解析失败：{exc}")
+            return
+        except Exception as exc:
+            yield event.plain_result(f"❌ 读取快照 {target_name} 失败：{exc}")
+            return
+
+        if not incoming:
+            yield event.plain_result(f"❌ 快照 {target_name} 里没有可用记录。")
+            return
+
+        try:
+            _report, tail = await self._apply_pack_import(
+                incoming, chosen_mode, dry, invalid_incoming
+            )
+        except EmotionPackError as exc:
+            yield event.plain_result(f"❌ {exc}")
+            return
+
+        title = "♻️ 感情包恢复（试运行）" if dry else "♻️ 感情包恢复"
+        head = [title, f"快照: {target_name}"]
+        note = str((meta or {}).get("note") or "").strip()
+        if note:
+            head.append(f"备注: {note[:120]}")
+        yield event.plain_result("\n".join(head) + "\n" + tail)
 
     @filter.command("合成")
     async def direct_tts_command(
@@ -1076,16 +1612,25 @@ class GenieTtsLlmPlugin(Star):
             "【音色】\n"
             "• /sw 角色 感情（切换感情）\n"
             "• /sw-w 角色（切换w角色）\n"
-            "• /查看感情 列出已注册角色与感情\n"
+            "• /查看感情 [角色] 列出已注册角色与感情\n"
             "• /注册感情 角色 感情 参考音频相对路径 参考文本 [语言]\n"
             "• /删除感情 角色 感情\n"
             "【合成】\n"
             "• /合成 角色 感情 文本 手动合成一条语音\n"
             "• /tts-again（重发语音）重发本会话最近一条语音\n"
+            "【感情包】\n"
+            "• /感情导出 [角色] 导出感情包 JSON（省略角色=全部）\n"
+            "• /感情导入 [模式] [试运行] 附 JSON / 引用消息 / 上传文件\n"
+            "• /感情包 列出服务端快照\n"
+            "• /感情包保存 [文件名] 存一份当前感情库\n"
+            "• /感情包恢复 文件名 [模式] [试运行]\n"
+            "  模式：merge 只补新（默认）/ overwrite 冲突覆盖 / replace 先清空\n"
             "【诊断】\n"
             "• /tts-status（语音状态）开关、音色、队列与服务器状态\n"
             "• /tts-help（语音帮助）显示本帮助\n"
-            "开关与音色选择会自动持久化，重启 AstrBot 后不会丢。"
+            "开关与音色选择会自动持久化，重启 AstrBot 后不会丢。\n"
+            "更省事的做法：在 AstrBot WebUI 的插件页打开「语音合成工作台」，"
+            "可视化管理感情、试听分段、导入导出感情包。"
         )
 
     @filter.llm_tool(name="genie_tts_speak")
