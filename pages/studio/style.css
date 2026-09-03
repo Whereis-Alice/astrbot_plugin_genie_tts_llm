@@ -6,6 +6,14 @@
 
 *, *::before, *::after { box-sizing: border-box; }
 
+/* 全局隐藏兜底 —— 必须放在所有组件规则之前。
+   .view / .row-tight / .savebar / .modal / .boot 这类容器自带 display:flex，
+   作者样式表里的类选择器会盖掉浏览器 UA 样式表的 [hidden]{display:none}，
+   于是 JS 里的 el.hidden = true 只写进了属性、元素照旧显示。
+   v1.9.0 的「点 tab 不切换、8 个分区全堆在一页」就是这个原因。
+   这里用 !important 一次性兜住，以后新加带 display 的类不用再单独补 [hidden]。 */
+[hidden] { display: none !important; }
+
 :root {
   --font-sans: "Inter", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
   --font-serif: "Noto Serif JP", "Source Han Serif SC", "Songti SC", "Georgia", serif;

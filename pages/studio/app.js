@@ -47,6 +47,18 @@ function h(tag, attrs, kids) {
 
 function clear(node) { while (node && node.firstChild) node.removeChild(node.firstChild); return node; }
 
+/* 切分区后把滚动位置拉回顶部。
+   插件页跑在 iframe 里，topbar / tabbar 都是 sticky，如果不复位，
+   从长分区（比如感情库）切到别的分区时视口还停在页尾，看起来像「没切过去」。
+   harness 的 window 没有 scrollTo，所以每一步都做 typeof 判断 + try/catch。 */
+function scrollTopSafe() {
+  try {
+    if (typeof window !== "undefined" && typeof window.scrollTo === "function") window.scrollTo(0, 0);
+  } catch (e1) {}
+  try { if (D.documentElement) D.documentElement.scrollTop = 0; } catch (e2) {}
+  try { if (D.body) D.body.scrollTop = 0; } catch (e3) {}
+}
+
 /* ------------------------------------------------------------ 格式化 */
 
 function fmtBytes(n) {
@@ -510,6 +522,7 @@ function busyView(id, msg) {
 
 function go(tab) {
   if (!VIEWS[tab]) tab = "studio";
+  var changed = state.tab !== tab;
   state.tab = tab;
   TABS.forEach(function (t) {
     var v = viewNode(t.id);
@@ -517,6 +530,7 @@ function go(tab) {
     var b = $("tab-" + t.id);
     if (b) b.setAttribute("aria-selected", t.id === tab ? "true" : "false");
   });
+  if (changed) scrollTopSafe();
   savePrefs();
   if (LOADERS[tab] && !state.loaded[tab]) {
     busyView(tab, "正在读取数据…");
@@ -855,19 +869,26 @@ function renderStudio() {
   ui.resultCard = h("div");
 
   /* ---------- 侧栏 ---------- */
-  var st = o.stats || {};
+  /* RUNTIME 卡只重建这一格，不整体重渲分区：
+     整体重渲会把试听区的 <audio> 换成新节点，正在播放的语音会被打断。 */
+  ui.statGrid = h("div", { class: "stat-grid" });
+  function syncStats() {
+    var st = (state.overview || {}).stats || {};
+    clear(ui.statGrid);
+    append(ui.statGrid, [
+      stat(st.requests || 0, "总请求", "accent"),
+      stat(st.succeeded || 0, "成功", "ok"),
+      stat(st.failed || 0, "失败", (st.failed ? "danger" : null)),
+      stat(st.skipped_no_speech || 0, "无可读内容"),
+      stat(st.leak_guard_hits || 0, "泄漏拦截", (st.leak_guard_hits ? "warn" : null)),
+      stat(st.queue_size || 0, "排队中")
+    ]);
+  }
   var side = h("aside", { class: "side" }, [
     card({
       kicker: "RUNTIME", title: "运行统计", sub: false,
-      tools: [btn("⟳", { sm: true, kind: "ghost", title: "只刷新统计", onclick: function () { refreshOverview().then(function () { renderStudio(); }); } })],
-      body: [h("div", { class: "stat-grid" }, [
-        stat(st.requests || 0, "总请求", "accent"),
-        stat(st.succeeded || 0, "成功", "ok"),
-        stat(st.failed || 0, "失败", (st.failed ? "danger" : null)),
-        stat(st.skipped_no_speech || 0, "无可读内容"),
-        stat(st.leak_guard_hits || 0, "泄漏拦截", (st.leak_guard_hits ? "warn" : null)),
-        stat(st.queue_size || 0, "排队中")
-      ])]
+      tools: [btn("⟳", { sm: true, kind: "ghost", title: "只刷新统计", onclick: function () { refreshOverview().then(syncStats); } })],
+      body: [ui.statGrid]
     }),
     card({
       kicker: "LIMITS", title: "限额与开关",
@@ -898,6 +919,7 @@ function renderStudio() {
     side
   ]));
 
+  syncStats();
   syncVoice();
   renderPreviewCard();
   renderResultCard();
@@ -1087,13 +1109,15 @@ function renderStudio() {
       renderHistory();
       ui.status.textContent = "完成，耗时 " + fmtSec(d.elapsed_seconds || (Date.now() - t0) / 1000);
       toast("合成成功：" + fmtSec(d.duration_seconds) + " / " + fmtBytes(d.bytes), "ok");
-      refreshOverview();
     }).catch(function (e) { fail(e, "合成失败"); ui.status.textContent = ""; })
       .then(function () {
         s.synthing = false;
         ui.synthBtn.disabled = false;
         clear(ui.synthBtn);
         append(ui.synthBtn, "合成并试听");
+        /* 成功和失败都要刷：失败也会让「失败」计数 +1。
+           refreshOverview() 内部已吞掉异常，这里不会再抛。 */
+        return refreshOverview().then(syncStats);
       });
   }
 }
