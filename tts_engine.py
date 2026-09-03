@@ -48,6 +48,37 @@ MAX_CUSTOM_PAUSE_MS = 3000
 DEFAULT_LEAK_GUARD_SECONDS_PER_CHAR = 0.9
 DEFAULT_LEAK_GUARD_MIN_SECONDS = 3.0
 
+# --- 截断防护 ---
+# Space 端的 T2S 采样没有固定随机种子，同一句话偶尔会在第一步就吐出 EOS，那个
+# 句段会被服务端静默丢掉：落在中间就吞掉一个分句，落在最后就是「话没说完突然
+# 结束」。根治在 Space（同一句段重新采样），这里是兜底——结果明显短于文本应有
+# 的长度就重合成一次。日语实测最快 0.148s/可发音字，默认阈值取其一半，留足 30%
+# 以上余量，只抓量级异常，不误伤语速快的短句。
+DEFAULT_TRUNCATION_GUARD_SECONDS_PER_CHAR = 0.10
+MAX_TRUNCATION_GUARD_SECONDS_PER_CHAR = 0.5
+# 少于这个可发音字数时单字时长波动太大，判不准，直接放行（整段为空另有兜底）。
+MIN_TRUNCATION_GUARD_CHARS = 4
+
+# --- 尾部补静音 ---
+# Space 有意丢掉每次请求末尾的句间停顿，成品最后一个音几乎贴着文件结尾；QQ 这
+# 类平台还会把 WAV 转成 silk 再播放，实测尾帧偶尔被吃掉。补一小段静音是最便宜
+# 的保险，不改变已合成的语音内容。
+DEFAULT_TAIL_PADDING_MS = 180
+MAX_TAIL_PADDING_MS = 2000
+
+# --- 超长文本截断 ---
+# 默认 300 字：够装下绝大多数一次性回复，又不会让一条消息排出十几个分块。历史默认
+# 值是 150，长回复经常在半路被砍掉，听起来就是「话没说完」。
+DEFAULT_MAX_TEXT_LENGTH = 300
+# tts_max_text_length 之外的内容会被直接丢掉（只影响送入 TTS 的文本，展示的文字
+# 仍是完整原文）。切在句末标点上听起来是「说完了」，切在逗号/顿号上听起来就是
+# 「话没说完突然断了」，所以两类标点必须分开优先级：先找句末，找不到才退让到软
+# 停顿，最后才硬切。
+STRONG_TRUNCATE_BOUNDARY_CHARS = "\u3002\uff01\uff1f!?\u2026\uff0e.\n"
+SOFT_TRUNCATE_BOUNDARY_CHARS = "\u3001\uff0c,\uff1b;\uff1a:"
+# 句末标点后面常跟收尾的引号/括号，一起带上才不会把「」拆散。
+TRUNCATE_TRAILING_CLOSERS = "\u300d\u300f\u3011\uff09\u300b\u201d\u2019\"'"
+
 # --- 分段拼接的停顿补偿 ---
 # Space 只在单次请求内部插入句间停顿，请求最后一句欠的那一拍会被有意丢掉
 # （否则每条语音结尾都会多出一段死气）。开启句子切分后一条消息会被拆成多次
@@ -66,14 +97,25 @@ AUTO_ELLIPSIS_PAUSE_MS = 420
 AUTO_PAUSE_BOUNDARY_PATTERN = re.compile(r"…+|\.{2,}|[。．！？.!?]+|[\r\n]+")
 
 
+def strip_pause_markers(text: str) -> str:
+    """剥掉 [pause=ms] 标记本身，只留下真正会被念出来的文本。
+
+    标记永远不会被朗读（关闭时在送入 TTS 前剥除，开启时由 Space 换成静音），但
+    "pause" 和后面的数字本身落在可发音字符集里。不先剥掉的话：一条只有标记的
+    消息会被判成「有内容」送去合成（正好触发参考音频泄漏），带标记的正常句子也
+    会把可发音字数算大，让截断防护误判偏短、白白重试一次。
+    """
+    return PAUSE_MARKER_PATTERN.sub(" ", text or "")
+
+
 def has_pronounceable(text: str) -> bool:
-    """判断文本里是否存在至少一个可发音字符。"""
-    return bool(PRONOUNCEABLE_PATTERN.search(text or ""))
+    """判断文本里是否存在至少一个可发音字符（不含 [pause] 标记自身）。"""
+    return bool(PRONOUNCEABLE_PATTERN.search(strip_pause_markers(text)))
 
 
 def count_pronounceable(text: str) -> int:
-    """统计文本里的可发音字符数量，用于估算合理音频时长。"""
-    return len(PRONOUNCEABLE_PATTERN.findall(text or ""))
+    """统计可发音字符数量（不含 [pause] 标记自身），用于估算合理音频时长。"""
+    return len(PRONOUNCEABLE_PATTERN.findall(strip_pause_markers(text)))
 
 
 def pause_budget_seconds(text: str) -> float:
@@ -141,6 +183,8 @@ class TTSEngine:
             "failed": 0,
             "skipped_no_speech": 0,
             "leak_guard_hits": 0,
+            "truncation_guard_hits": 0,
+            "text_truncated": 0,
         }
 
         # 启动清理任务
@@ -213,26 +257,41 @@ class TTSEngine:
         """将过长文本按句子边界截断，避免超长回复被切成过多块、长时间排队等待。
 
         仅影响送入 TTS 的音频文本；audio_and_text 模式下展示给用户的文字仍是完整原文。
+        优先切在句末标点上；句末标点太靠前才退让到逗号一类的软停顿，并把软停顿本身
+        去掉（后面会由 _ensure_terminal_punctuation 补上句号），否则听起来就是「话没
+        说完突然断了」；两档都不可用才硬切。
         """
         text = (text or "").strip()
         if max_length <= 0 or len(text) <= max_length:
             return text
 
         window = text[:max_length]
-        boundary_chars = "。！？!?…．.、，,；;\n"
-        cut_at = -1
-        for idx in range(len(window) - 1, -1, -1):
-            if window[idx] in boundary_chars:
-                cut_at = idx + 1
-                break
+        # 边界过于靠前会丢掉太多内容，低于这个下限就换下一档策略。
+        floor = max(1, max_length // 2)
+        for boundary_chars, keep_mark in (
+            (STRONG_TRUNCATE_BOUNDARY_CHARS, True),
+            (SOFT_TRUNCATE_BOUNDARY_CHARS, False),
+        ):
+            hit = -1
+            for idx in range(len(window) - 1, -1, -1):
+                if window[idx] in boundary_chars:
+                    hit = idx
+                    break
+            if hit < 0 or hit + 1 < floor:
+                continue
+            cut_at = hit + 1 if keep_mark else hit
+            if keep_mark:
+                # 句末标点后常跟收尾的引号/括号，一起带上才不会把「」拆散。
+                while (
+                    cut_at < len(window)
+                    and window[cut_at] in TRUNCATE_TRAILING_CLOSERS
+                ):
+                    cut_at += 1
+            truncated = window[:cut_at].strip()
+            if truncated:
+                return truncated
 
-        # 边界过于靠前会丢掉太多内容，此时退回硬截断，至少保留一半长度。
-        if cut_at >= max(1, max_length // 2):
-            truncated = window[:cut_at]
-        else:
-            truncated = window
-
-        return truncated.strip()
+        return window.strip()
 
     async def _cleanup_loop(self):
         """定期清理过期的临时音频文件"""
@@ -394,6 +453,15 @@ class TTSEngine:
             gap_ms = DEFAULT_CHUNK_GAP_MS
         return max(0, min(gap_ms, MAX_CHUNK_GAP_MS))
 
+    def _tail_padding_ms(self) -> int:
+        """补在成品语音末尾的静音时长（毫秒），已 clamp 到合法区间。"""
+        raw = self.config.get("tts_tail_padding_ms", DEFAULT_TAIL_PADDING_MS)
+        try:
+            padding_ms = int(raw)
+        except (TypeError, ValueError):
+            padding_ms = DEFAULT_TAIL_PADDING_MS
+        return max(0, min(padding_ms, MAX_TAIL_PADDING_MS))
+
     @staticmethod
     def _boundary_gap_ms(previous_chunk: Optional[str], gap_ms: int) -> int:
         """按上一块的结尾标点决定这个拼接点该补多久静音。
@@ -468,6 +536,42 @@ class TTSEngine:
             for file_path in input_paths:
                 self._discard_temp_file(file_path)
 
+    def _append_tail_padding(
+        self, audio_path: Optional[str], session_id_for_log: str
+    ) -> Optional[str]:
+        """在成品 WAV 末尾补一小段静音，防止最后一个字被播放端吞掉。
+
+        Space 刻意丢掉每次请求末尾的句间停顿，所以最后一个音几乎贴着文件结尾；
+        再叠上 QQ 的 silk 转码和播放器的收尾，尾音听起来就像被硬切。补静音不会
+        改变已合成的语音内容，失败时沿用原音频，绝不因为补静音把整条语音搞没。
+        """
+        padding_ms = self._tail_padding_ms()
+        if not audio_path or padding_ms <= 0:
+            return audio_path
+
+        padded_path = self.temp_audio_dir / f"{uuid.uuid4()}_tail.wav"
+        try:
+            with wave.open(audio_path, "rb") as wf_in:
+                params = wf_in.getparams()
+                frames = wf_in.readframes(wf_in.getnframes())
+            pad_frames = round(params.framerate * padding_ms / 1000)
+            if pad_frames <= 0:
+                return audio_path
+            frame_bytes = params.nchannels * params.sampwidth
+            with wave.open(str(padded_path), "wb") as wf_out:
+                wf_out.setparams(params)
+                wf_out.writeframes(frames)
+                wf_out.writeframes(b"\x00" * (pad_frames * frame_bytes))
+        except Exception as e:
+            logger.warning(
+                f"[{session_id_for_log}] 尾部补静音失败，沿用原音频: {e}"
+            )
+            self._discard_temp_file(str(padded_path))
+            return audio_path
+
+        self._discard_temp_file(audio_path)
+        return str(padded_path)
+
     def _get_server_lock(self, server_url: str) -> asyncio.Lock:
         """获取或创建指定服务器的锁，用于保证 set_reference_audio + /tts 的原子性。"""
         if server_url not in self._server_locks:
@@ -508,6 +612,50 @@ class TTSEngine:
             + auto_pause_budget_seconds(text)
         )
         return max(floor_seconds, budget)
+
+    def _truncation_guard_enabled(self) -> bool:
+        return bool(self.config.get("enable_tts_truncation_guard", True))
+
+    def _minimum_audio_seconds(self, text: str) -> float:
+        """按可发音字符数估算这段文本合理的最低音频时长（秒）。
+
+        只用来识别「服务端漏掉了整个句段 / 采样提前吐 EOS」这类明显缺字的结果。
+        刻意不把文本自带的停顿算进下限：停顿是静音，缺了不影响「字有没有念全」，
+        算进来只会抬高阈值、把正常结果误判成截断。
+        """
+        per_char = self.config.get(
+            "tts_truncation_guard_seconds_per_char",
+            DEFAULT_TRUNCATION_GUARD_SECONDS_PER_CHAR,
+        )
+        try:
+            per_char = float(per_char)
+        except (TypeError, ValueError):
+            per_char = DEFAULT_TRUNCATION_GUARD_SECONDS_PER_CHAR
+        per_char = max(0.0, min(per_char, MAX_TRUNCATION_GUARD_SECONDS_PER_CHAR))
+        voiced = count_pronounceable(text)
+        if per_char <= 0 or voiced < MIN_TRUNCATION_GUARD_CHARS:
+            return 0.0
+        return voiced * per_char
+
+    @staticmethod
+    def _duration_penalty(
+        seconds: float, minimum_seconds: float, expected_seconds: float
+    ) -> tuple[int, float]:
+        """给一次合成结果的时长打分，元组越小越好。
+
+        (2, 超出量)：过长，疑似整条参考音频被拼进结果，用户会听到「上次的语音
+                     ＋这次的」，这是最坏的情况；
+        (1, 缺失量)：过短，疑似句段被服务端漏掉或采样提前结束，会缺字；
+        (0, 0.0)  ：落在合理区间。
+
+        同一档内取偏离更小的一次，于是「两次都偏长取更短的」「两次都偏短取更长
+        的」由同一个比较式覆盖，两个防护也不会互相打架。
+        """
+        if expected_seconds > 0 and seconds > expected_seconds:
+            return 2, seconds - expected_seconds
+        if minimum_seconds > 0 and seconds < minimum_seconds:
+            return 1, minimum_seconds - seconds
+        return 0, 0.0
 
     async def _stream_tts_to_file(
         self,
@@ -616,9 +764,15 @@ class TTSEngine:
 
                 leak_guard = self._leak_guard_enabled()
                 expected_seconds = self._expected_audio_seconds(text) if leak_guard else 0.0
+                truncation_guard = self._truncation_guard_enabled()
+                minimum_seconds = (
+                    self._minimum_audio_seconds(text) if truncation_guard else 0.0
+                )
+                best_penalty: Optional[tuple[int, float]] = None
                 best_seconds = 0.0
 
-                # 最多合成两次：第一次结果时长量级异常时重试并保留较短的一次。
+                # 最多合成两次：第一次结果时长量级异常（偏长＝疑似参考音频泄漏，
+                # 偏短＝疑似句段被漏掉）时重试一次，保留更接近合理区间的那一次。
                 for attempt in range(2):
                     audio_path, audio_seconds = await self._stream_tts_to_file(
                         server_url,
@@ -628,11 +782,7 @@ class TTSEngine:
                         session_id_for_log,
                     )
                     if not audio_path:
-                        if (
-                            leak_guard
-                            and best_path is not None
-                            and best_seconds > expected_seconds
-                        ):
+                        if best_penalty is not None and best_penalty[0] == 2:
                             # 首次结果已被判定为疑似泄漏，重试又没拿回音频：
                             # 宁可这次合成失败，也不要把叠加音频发给用户。
                             logger.warning(
@@ -641,30 +791,50 @@ class TTSEngine:
                             )
                             self._discard_temp_file(best_path)
                             return None
+                        # 偏短的首次结果留着：缺几个字也好过整条语音发不出去。
                         return best_path
 
-                    if best_path is None or audio_seconds < best_seconds:
+                    penalty = self._duration_penalty(
+                        audio_seconds, minimum_seconds, expected_seconds
+                    )
+                    if best_penalty is None or penalty < best_penalty:
                         self._discard_temp_file(best_path)
-                        best_path, best_seconds = audio_path, audio_seconds
+                        best_path = audio_path
+                        best_penalty, best_seconds = penalty, audio_seconds
                     else:
                         self._discard_temp_file(audio_path)
 
-                    if not leak_guard or best_seconds <= expected_seconds:
+                    if best_penalty[0] == 0:
                         return best_path
 
-                    if attempt == 0:
-                        # 同一次合成只计一次，避免重试把统计翻倍
-                        self.stats["leak_guard_hits"] += 1
-                    tail = (
-                        "正在重试一次。"
-                        if attempt == 0
-                        else "两次结果均偏长，采用较短的一次。"
-                    )
-                    logger.warning(
-                        f"[{session_id_for_log}] 合成结果异常偏长"
-                        f"（{audio_seconds:.2f}s > 预期上限 {expected_seconds:.2f}s），"
-                        f"疑似参考音频被拼入结果。{tail}"
-                    )
+                    retrying = attempt == 0
+                    if best_penalty[0] == 2:
+                        if retrying:
+                            # 同一次合成只计一次，避免重试把统计翻倍
+                            self.stats["leak_guard_hits"] += 1
+                        logger.warning(
+                            f"[{session_id_for_log}] 合成结果异常偏长"
+                            f"（{audio_seconds:.2f}s > 预期上限 {expected_seconds:.2f}s），"
+                            f"疑似参考音频被拼入结果。"
+                            + (
+                                "正在重试一次。"
+                                if retrying
+                                else f"两次结果均偏长，采用较短的一次（{best_seconds:.2f}s）。"
+                            )
+                        )
+                    else:
+                        if retrying:
+                            self.stats["truncation_guard_hits"] += 1
+                        logger.warning(
+                            f"[{session_id_for_log}] 合成结果异常偏短"
+                            f"（{audio_seconds:.2f}s < 预期下限 {minimum_seconds:.2f}s），"
+                            f"疑似句段被漏掉或尾音被截断。"
+                            + (
+                                "正在重试一次。"
+                                if retrying
+                                else f"两次结果均偏短，采用较长的一次（{best_seconds:.2f}s）。"
+                            )
+                        )
 
                 return best_path
             except Exception as e:
@@ -765,7 +935,31 @@ class TTSEngine:
         session_id_for_log: str,
         language: str = None,
     ) -> Optional[str]:
-        """执行单个请求的合成逻辑。由全局队列调度器按 FIFO 调用。"""
+        """合成一条语音并做统一收尾。由全局队列调度器按 FIFO 调用。
+
+        尾部补静音放在这一层：单块模式、单块归并、多块合并三条出口都会经过，
+        不用在每个 return 点各补一次。
+        """
+        audio_path = await self._synthesize_audio(
+            character_name=character_name,
+            ref_audio_path=ref_audio_path,
+            ref_audio_text=ref_audio_text,
+            text=text,
+            session_id_for_log=session_id_for_log,
+            language=language,
+        )
+        return self._append_tail_padding(audio_path, session_id_for_log)
+
+    async def _synthesize_audio(
+        self,
+        character_name: str,
+        ref_audio_path: str,
+        ref_audio_text: str,
+        text: str,
+        session_id_for_log: str,
+        language: str = None,
+    ) -> Optional[str]:
+        """文本预处理、切分、调度服务器，返回未做收尾处理的音频路径。"""
 
         # 全局锁确保语音请求按顺序处理，先请求的先完成
         async with self._synthesis_lock:
@@ -798,20 +992,26 @@ class TTSEngine:
                     self.stats["skipped_no_speech"] += 1
                     return None
 
-            max_text_length = self.config.get("tts_max_text_length", 150)
+            max_text_length = self.config.get(
+                "tts_max_text_length", DEFAULT_MAX_TEXT_LENGTH
+            )
             try:
                 max_text_length = int(max_text_length)
             except (TypeError, ValueError):
-                max_text_length = 150
+                max_text_length = DEFAULT_MAX_TEXT_LENGTH
             if max_text_length > 0 and len(text_for_tts) > max_text_length:
                 truncated_text = self._truncate_text_for_tts(
                     text_for_tts, max_text_length
                 )
                 if truncated_text and truncated_text != text_for_tts:
-                    logger.info(
-                        f"[{session_id_for_log}] TTS文本超过长度上限({max_text_length})，"
-                        f"已截断: {len(text_for_tts)} -> {len(truncated_text)} 字符。"
+                    logger.warning(
+                        f"[{session_id_for_log}] TTS文本超过长度上限"
+                        f"(tts_max_text_length={max_text_length})，已截断: "
+                        f"{len(text_for_tts)} -> {len(truncated_text)} 字符，"
+                        f"超长部分不会被朗读。听起来「话没说完」就调大这个上限"
+                        f"（0 表示不限制）。"
                     )
+                    self.stats["text_truncated"] += 1
                     text_for_tts = truncated_text
 
             punctuated_text = self._ensure_terminal_punctuation(text_for_tts, language)

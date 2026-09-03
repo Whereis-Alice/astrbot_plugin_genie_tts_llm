@@ -881,6 +881,8 @@ function renderStudio() {
       stat(st.failed || 0, "失败", (st.failed ? "danger" : null)),
       stat(st.skipped_no_speech || 0, "无可读内容"),
       stat(st.leak_guard_hits || 0, "泄漏拦截", (st.leak_guard_hits ? "warn" : null)),
+      stat(st.truncation_guard_hits || 0, "截断拦截", (st.truncation_guard_hits ? "warn" : null)),
+      stat(st.text_truncated || 0, "文本超长", (st.text_truncated ? "warn" : null)),
       stat(st.queue_size || 0, "排队中")
     ]);
   }
@@ -900,6 +902,7 @@ function renderStudio() {
           ["重试", lim.max_retries],
           ["段间停顿", fmtMs(lim.chunk_gap_ms)],
           ["每段句数", lim.sentences_per_chunk],
+          ["尾部静音", fmtMs(lim.tail_padding_ms)],
           ["采样率", (lim.sample_rate || 32000) + " Hz"]
         ]),
         h("div", { class: "chips" }, [
@@ -907,7 +910,8 @@ function renderStudio() {
           chip((tog.custom_pause_marker ? "[pause] 开" : "[pause] 关"), tog.custom_pause_marker ? "chip-ok" : "chip-warn"),
           chip((tog.text_cleaning ? "清洗 开" : "清洗 关"), tog.text_cleaning ? "chip-ok" : ""),
           chip((tog.translation ? "翻译 开" : "翻译 关"), tog.translation ? "chip-ok" : ""),
-          chip((tog.leak_guard ? "泄漏防护 开" : "泄漏防护 关"), tog.leak_guard ? "chip-ok" : "chip-warn")
+          chip((tog.leak_guard ? "泄漏防护 开" : "泄漏防护 关"), tog.leak_guard ? "chip-ok" : "chip-warn"),
+          chip((tog.truncation_guard ? "截断防护 开" : "截断防护 关"), tog.truncation_guard ? "chip-ok" : "chip-warn")
         ])
       ]
     }),

@@ -36,8 +36,11 @@ from .tts_engine import (
     BYTES_PER_SAMPLE,
     CHANNELS,
     DEFAULT_CHUNK_GAP_MS,
+    DEFAULT_MAX_TEXT_LENGTH,
+    DEFAULT_TAIL_PADDING_MS,
     MAX_CHUNK_GAP_MS,
     MAX_CUSTOM_PAUSE_MS,
+    MAX_TAIL_PADDING_MS,
     PAUSE_MARKER_PATTERN,
     SAMPLE_RATE,
     auto_pause_budget_seconds,
@@ -97,7 +100,7 @@ DEFAULT_DENSITY = "comfortable"
 
 # --------------------------------------------------------------- 配置分组
 
-# 配置页按业务含义分组渲染，而不是按 _conf_schema.json 的原始顺序——36 个键
+# 配置页按业务含义分组渲染，而不是按 _conf_schema.json 的原始顺序——39 个键
 # 平铺出来没人看得懂。未列出的键会被收进"其它"分组，所以以后加配置项也不会
 # 在页面上凭空消失。
 CONFIG_GROUPS: Tuple[Tuple[str, str, str, Tuple[str, ...]], ...] = (
@@ -187,12 +190,15 @@ CONFIG_GROUPS: Tuple[Tuple[str, str, str, Tuple[str, ...]], ...] = (
     ),
     (
         "guard",
-        "泄漏防护与持久化",
-        "防止指令原文被直接发出，以及重启后恢复开关状态。",
+        "音质防护与持久化",
+        "拦截「参考音频被拼进结果」和「句段被漏掉导致尾音截断」两类异常，并在重启后恢复开关状态。",
         (
             "enable_tts_leak_guard",
             "tts_leak_guard_seconds_per_char",
             "tts_leak_guard_min_seconds",
+            "enable_tts_truncation_guard",
+            "tts_truncation_guard_seconds_per_char",
+            "tts_tail_padding_ms",
             "enable_state_persistence",
         ),
     ),
@@ -539,10 +545,16 @@ class GenieWebApi:
                     "failed": _as_int(stats.get("failed"), 0),
                     "skipped_no_speech": _as_int(stats.get("skipped_no_speech"), 0),
                     "leak_guard_hits": _as_int(stats.get("leak_guard_hits"), 0),
+                    "truncation_guard_hits": _as_int(
+                        stats.get("truncation_guard_hits"), 0
+                    ),
+                    "text_truncated": _as_int(stats.get("text_truncated"), 0),
                     "queue_size": engine.queue_size() if engine else 0,
                 },
                 "limits": {
-                    "max_text_length": _as_int(config.get("tts_max_text_length"), 150),
+                    "max_text_length": _as_int(
+                        config.get("tts_max_text_length"), DEFAULT_MAX_TEXT_LENGTH
+                    ),
                     "synth_text_limit": MAX_SYNTH_TEXT_LENGTH,
                     "timeout_seconds": _as_int(config.get("tts_timeout_seconds"), 120),
                     "max_retries": _as_int(config.get("tts_max_retries"), 3),
@@ -551,6 +563,10 @@ class GenieWebApi:
                     "max_custom_pause_ms": MAX_CUSTOM_PAUSE_MS,
                     "sentences_per_chunk": _as_int(config.get("sentences_per_chunk"), 2),
                     "sample_rate": SAMPLE_RATE,
+                    "tail_padding_ms": _as_int(
+                        config.get("tts_tail_padding_ms"), DEFAULT_TAIL_PADDING_MS
+                    ),
+                    "max_tail_padding_ms": MAX_TAIL_PADDING_MS,
                 },
                 "toggles": {
                     "sentence_splitting": _as_bool(config.get("enable_sentence_splitting")),
@@ -558,6 +574,9 @@ class GenieWebApi:
                     "translation": _as_bool(config.get("enable_translation"), True),
                     "text_cleaning": _as_bool(config.get("enable_tts_text_cleaning")),
                     "leak_guard": _as_bool(config.get("enable_tts_leak_guard"), True),
+                    "truncation_guard": _as_bool(
+                        config.get("enable_tts_truncation_guard"), True
+                    ),
                     "state_persistence": _as_bool(config.get("enable_state_persistence"), True),
                     "failure_notice": _as_bool(config.get("enable_tts_failure_notice"), True),
                     "keepalive": _as_bool(config.get("enable_space_keepalive")),
@@ -1292,7 +1311,9 @@ class GenieWebApi:
                     }
                 )
 
-        max_text_length = _as_int(config.get("tts_max_text_length"), 150)
+        max_text_length = _as_int(
+            config.get("tts_max_text_length"), DEFAULT_MAX_TEXT_LENGTH
+        )
         truncated = False
         if max_text_length > 0 and len(current) > max_text_length:
             shortened = engine._truncate_text_for_tts(current, max_text_length)
@@ -1305,7 +1326,9 @@ class GenieWebApi:
                         + str(max_text_length)
                         + " 字，截到 "
                         + str(len(shortened))
-                        + " 字",
+                        + " 字；后面 "
+                        + str(len(current) - len(shortened))
+                        + " 字不会被朗读",
                     }
                 )
                 current = shortened

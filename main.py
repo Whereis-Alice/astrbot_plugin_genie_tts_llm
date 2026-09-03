@@ -17,7 +17,7 @@ from astrbot.api.provider import LLMResponse, ProviderRequest
 from . import emotion_pack
 from .emotion_pack import EmotionPackError
 from .emotion_manager import EmotionManager
-from .tts_engine import TTSEngine, has_pronounceable
+from .tts_engine import DEFAULT_MAX_TEXT_LENGTH, TTSEngine, has_pronounceable
 from .external_apis import translate_text
 
 
@@ -25,14 +25,14 @@ from .external_apis import translate_text
     "astrbot_plugin_genie_tts_llm",
     "Whereis-Alice",
     "一个通过 LLM、翻译和 Genie TTS 实现语音合成的插件，支持主动语音工具",
-    "1.9.1",
+    "1.9.2",
     "https://github.com/Whereis-Alice/astrbot_plugin_genie_tts_llm",
 )
 class GenieTtsLlmPlugin(Star):
     # 会话开关/音色选择的持久化键。AstrBot 的插件 KV 存储按 plugin_id 隔离。
     STATE_KV_KEY = "session_state_v1"
     # 插件版本号：WebUI 总览与感情包元数据都会读它。
-    PLUGIN_VERSION = "1.9.1"
+    PLUGIN_VERSION = "1.9.2"
     # 感情包快照目录名（位于插件数据目录下）。
     PACK_DIR_NAME = "emotion_packs"
     # 能被识别为「导入模式」的 token，真正的语义交给 emotion_pack 归一化。
@@ -1524,13 +1524,28 @@ class GenieTtsLlmPlugin(Star):
 
         stats = self.tts_engine.stats
         lines.append(
-            "• 合成统计: 成功 %d / 失败 %d / 无朗读内容跳过 %d / 参考音频泄漏拦截 %d"
+            "• 合成统计: 成功 %d / 失败 %d / 无朗读内容跳过 %d / "
+            "泄漏拦截 %d / 截断拦截 %d"
             % (
                 stats.get("succeeded", 0),
                 stats.get("failed", 0),
                 stats.get("skipped_no_speech", 0),
                 stats.get("leak_guard_hits", 0),
+                stats.get("truncation_guard_hits", 0),
             )
+        )
+        text_truncated = stats.get("text_truncated", 0)
+        max_text_length = self.config.get(
+            "tts_max_text_length", DEFAULT_MAX_TEXT_LENGTH
+        )
+        truncated_note = (
+            "（超长部分未被朗读，调大「语音文本长度上限」可避免）"
+            if text_truncated
+            else ""
+        )
+        lines.append(
+            "• 文本超长截断: %s 次 / 上限 %s 字%s"
+            % (text_truncated, max_text_length, truncated_note)
         )
         lines.append(f"• 排队中的合成请求: {self.tts_engine.queue_size()}")
 
