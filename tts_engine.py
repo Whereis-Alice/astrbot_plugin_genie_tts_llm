@@ -185,6 +185,7 @@ class TTSEngine:
             "leak_guard_hits": 0,
             "truncation_guard_hits": 0,
             "text_truncated": 0,
+            "empty_result_retries": 0,
         }
 
         # 启动清理任务
@@ -791,6 +792,16 @@ class TTSEngine:
                             )
                             self._discard_temp_file(best_path)
                             return None
+                        if best_path is None and attempt == 0:
+                            # 一个字都没拿回来：后端整段合成失败。T2S 采样在第一步
+                            # 就吐结束符是随机事件，同一句话再抽一次几乎总能拿到，
+                            # 而这里直接返回 None 就是「这条语音发不出去」。
+                            self.stats["empty_result_retries"] += 1
+                            logger.warning(
+                                f"[{session_id_for_log}] 合成未返回任何音频"
+                                f"（后端整段失败），重试一次。"
+                            )
+                            continue
                         # 偏短的首次结果留着：缺几个字也好过整条语音发不出去。
                         return best_path
 

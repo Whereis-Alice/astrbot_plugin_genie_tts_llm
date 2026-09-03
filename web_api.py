@@ -549,6 +549,9 @@ class GenieWebApi:
                         stats.get("truncation_guard_hits"), 0
                     ),
                     "text_truncated": _as_int(stats.get("text_truncated"), 0),
+                    "empty_result_retries": _as_int(
+                        stats.get("empty_result_retries"), 0
+                    ),
                     "queue_size": engine.queue_size() if engine else 0,
                 },
                 "limits": {

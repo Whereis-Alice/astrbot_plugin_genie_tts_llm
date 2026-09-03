@@ -883,6 +883,7 @@ function renderStudio() {
       stat(st.leak_guard_hits || 0, "泄漏拦截", (st.leak_guard_hits ? "warn" : null)),
       stat(st.truncation_guard_hits || 0, "截断拦截", (st.truncation_guard_hits ? "warn" : null)),
       stat(st.text_truncated || 0, "文本超长", (st.text_truncated ? "warn" : null)),
+      stat(st.empty_result_retries || 0, "空结果重试", (st.empty_result_retries ? "warn" : null)),
       stat(st.queue_size || 0, "排队中")
     ]);
   }
