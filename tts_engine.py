@@ -48,6 +48,23 @@ MAX_CUSTOM_PAUSE_MS = 3000
 DEFAULT_LEAK_GUARD_SECONDS_PER_CHAR = 0.9
 DEFAULT_LEAK_GUARD_MIN_SECONDS = 3.0
 
+# --- 分段拼接的停顿补偿 ---
+# Space 只在单次请求内部插入句间停顿，请求最后一句欠的那一拍会被有意丢掉
+# （否则每条语音结尾都会多出一段死气）。开启句子切分后一条消息会被拆成多次
+# 请求再拼接，这时如果不补上这一拍，分段边界就完全没有停顿，听起来像一口气
+# 念完。这里按上一块的结尾标点决定补多久。
+DEFAULT_CHUNK_GAP_MS = 260
+MAX_CHUNK_GAP_MS = 2000
+CHUNK_SENTENCE_END_CHARS = "。．！？.!?…"
+CHUNK_SOFT_BREAK_CHARS = "、，,；;：:"
+CHUNK_TRAILING_TRIM_CHARS = " \t\r\n」』】）》”’\"'"
+
+# Space 端自动插入的停顿时长，仅用于泄漏防护的时长预算，需与 app.py 的
+# GENIE_SENTENCE_PAUSE_MS / GENIE_ELLIPSIS_PAUSE_MS 默认值保持一致。
+AUTO_SENTENCE_PAUSE_MS = 260
+AUTO_ELLIPSIS_PAUSE_MS = 420
+AUTO_PAUSE_BOUNDARY_PATTERN = re.compile(r"…+|\.{2,}|[。．！？.!?]+|[\r\n]+")
+
 
 def has_pronounceable(text: str) -> bool:
     """判断文本里是否存在至少一个可发音字符。"""
@@ -68,6 +85,23 @@ def pause_budget_seconds(text: str) -> float:
         except (TypeError, ValueError):
             continue
         total_ms += max(0, min(value, MAX_CUSTOM_PAUSE_MS))
+    return total_ms / 1000.0
+
+
+def auto_pause_budget_seconds(text: str) -> float:
+    """估算 Space 会自动插入的句间静音总时长（秒）。
+
+    Space 在句末标点后插入约 260ms、省略号后约 420ms 的静音，这是刻意加上的
+    呼吸感，不该被算进"参考音频泄漏"的判定里，否则停顿密集的文本（大量省略号
+    或换行）会被泄漏防护误伤、白白重试一次。刻意算得偏宽，只作为上限。
+    """
+    total_ms = 0
+    for match in AUTO_PAUSE_BOUNDARY_PATTERN.finditer(text or ""):
+        token = match.group(0)
+        if "…" in token or token.count(".") >= 2:
+            total_ms += AUTO_ELLIPSIS_PAUSE_MS
+        else:
+            total_ms += AUTO_SENTENCE_PAUSE_MS
     return total_ms / 1000.0
 
 
@@ -351,8 +385,44 @@ class TTSEngine:
         logger.info(f"文本已切分为 {len(chunks)} 个块。")
         return chunks
 
-    async def _merge_wav_files(self, input_paths: list[str]) -> Optional[str]:
-        """以无损的方式将多个WAV文件按顺序合并为一个，并清理分块文件。"""
+    def _chunk_gap_ms(self) -> int:
+        """分段拼接时补在块之间的静音基准时长（毫秒），已 clamp 到合法区间。"""
+        raw = self.config.get("chunk_gap_ms", DEFAULT_CHUNK_GAP_MS)
+        try:
+            gap_ms = int(raw)
+        except (TypeError, ValueError):
+            gap_ms = DEFAULT_CHUNK_GAP_MS
+        return max(0, min(gap_ms, MAX_CHUNK_GAP_MS))
+
+    @staticmethod
+    def _boundary_gap_ms(previous_chunk: Optional[str], gap_ms: int) -> int:
+        """按上一块的结尾标点决定这个拼接点该补多久静音。
+
+        句末标点 / 省略号 → 补满；逗号顿号这类软停顿 → 补一半；切在句子中间
+        （自定义切分正则可能不带标点）→ 不补，硬塞静音只会造成结巴感。
+        """
+        if gap_ms <= 0:
+            return 0
+        if previous_chunk is None:
+            return gap_ms
+        tail = previous_chunk.rstrip(CHUNK_TRAILING_TRIM_CHARS)
+        if not tail:
+            return gap_ms
+        if tail[-1] in CHUNK_SENTENCE_END_CHARS:
+            return gap_ms
+        if tail[-1] in CHUNK_SOFT_BREAK_CHARS:
+            return gap_ms // 2
+        return 0
+
+    async def _merge_wav_files(
+        self, input_paths: list[str], chunk_texts: Optional[list[str]] = None
+    ) -> Optional[str]:
+        """以无损的方式将多个WAV文件按顺序合并为一个，并清理分块文件。
+
+        块之间会按 chunk_gap_ms 补一段静音：Space 会丢掉每次请求末尾的句间
+        停顿，逐块裸拼会让分段边界的停顿归零，整条语音听起来像一口气念完。
+        采样参数一律取自实际音频，不用模块常量，避免服务端换采样率后错位。
+        """
         if not input_paths:
             return None
 
@@ -362,13 +432,31 @@ class TTSEngine:
             with wave.open(input_paths[0], "rb") as wf_in:
                 params = wf_in.getparams()
 
+            base_gap_ms = self._chunk_gap_ms()
+            frame_bytes = params.nchannels * params.sampwidth
+            inserted_ms = 0
+
             with wave.open(str(output_path), "wb") as wf_out:
                 wf_out.setparams(params)
-                for file_path in input_paths:
+                for index, file_path in enumerate(input_paths):
+                    if index:
+                        previous = (
+                            chunk_texts[index - 1]
+                            if chunk_texts and index - 1 < len(chunk_texts)
+                            else None
+                        )
+                        gap_ms = self._boundary_gap_ms(previous, base_gap_ms)
+                        if gap_ms:
+                            gap_frames = round(params.framerate * gap_ms / 1000)
+                            wf_out.writeframes(b"\x00" * (gap_frames * frame_bytes))
+                            inserted_ms += gap_ms
                     with wave.open(file_path, "rb") as wf_in:
                         wf_out.writeframes(wf_in.readframes(wf_in.getnframes()))
 
-            logger.info(f"成功将 {len(input_paths)} 个音频文件合并到: {output_path}")
+            logger.info(
+                f"成功将 {len(input_paths)} 个音频文件合并到: {output_path}"
+                f"（块间共补 {inserted_ms}ms 停顿）"
+            )
             return str(output_path)
 
         except Exception as e:
@@ -392,7 +480,7 @@ class TTSEngine:
         return bool(self.config.get("enable_tts_leak_guard", True))
 
     def _expected_audio_seconds(self, text: str) -> float:
-        """按可发音字符数 + 停顿标记估算这段文本合理的最大音频时长（秒）。
+        """按可发音字符数 + 停顿时长估算这段文本合理的最大音频时长（秒）。
 
         阈值刻意放得很宽（默认 0.9s/字，约为正常语速的 6 倍），只用于识别
         “整条参考音频被拼进结果”这类量级异常，不会误伤正常的慢速朗读。
@@ -414,7 +502,11 @@ class TTSEngine:
 
         per_char = max(per_char, 0.2)
         floor_seconds = max(floor_seconds, 1.0)
-        budget = count_pronounceable(text) * per_char + pause_budget_seconds(text)
+        budget = (
+            count_pronounceable(text) * per_char
+            + pause_budget_seconds(text)
+            + auto_pause_budget_seconds(text)
+        )
         return max(floor_seconds, budget)
 
     async def _stream_tts_to_file(
@@ -804,7 +896,9 @@ class TTSEngine:
                     return (
                         successful_paths[0]
                         if len(successful_paths) == 1
-                        else await self._merge_wav_files(successful_paths)
+                        else await self._merge_wav_files(
+                            successful_paths, text_chunks
+                        )
                     )
 
             # 如果不切分，则使用轮询逻辑

@@ -209,6 +209,13 @@
     "type": "string",
     "default": "([。、，！？,.!?])"
   },
+  "chunk_gap_ms": {
+    "title": "分段间停顿",
+    "description": "拼接补静音",
+    "hint": "开启句子切分后，一条消息会被拆成多次请求再拼接，而 Space 会丢掉每次请求末尾的句间停顿，导致分段边界处完全没有停顿、整条语音像一口气念完。这里按上一段的结尾标点补回：句末标点/省略号补满，逗号顿号补一半，切在句中不补。0 表示不补；建议与 Space 的 GENIE_SENTENCE_PAUSE_MS 保持一致（默认 260），上限 2000。",
+    "type": "int",
+    "default": 260
+  },
   "tts_max_text_length": {
     "title": "语音文本长度上限",
     "description": "过长截断",
