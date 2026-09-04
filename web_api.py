@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from astrbot.api import logger
 
 from . import emotion_pack
+from . import run_log as run_log_mod
 from .emotion_pack import EmotionPackError
 from .tts_engine import (
     BYTES_PER_SAMPLE,
@@ -202,6 +203,17 @@ CONFIG_GROUPS: Tuple[Tuple[str, str, str, Tuple[str, ...]], ...] = (
             "enable_state_persistence",
         ),
     ),
+    (
+        "diagnostics",
+        "日志与诊断",
+        "内存里的运行日志与合成轨迹，供「日志」页排查情感选得好不好。",
+        (
+            "enable_run_log",
+            "run_log_capacity",
+            "run_log_synth_capacity",
+            "run_log_full_text",
+        ),
+    ),
 )
 
 # 这几个键由后台常驻任务读取，改完需要重载插件才会真正生效。
@@ -210,6 +222,10 @@ RESTART_REQUIRED_KEYS = frozenset(
         "enable_space_keepalive",
         "space_keepalive_url",
         "space_keepalive_interval_minutes",
+        "enable_run_log",
+        "run_log_capacity",
+        "run_log_synth_capacity",
+        "run_log_full_text",
     }
 )
 
@@ -267,6 +283,16 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     if text in ("0", "false", "no", "off", "否", "关", ""):
         return False
     return default
+
+
+def _clamp_int(value: Any, low: int, high: int) -> int:
+    """把整数夹到 [low, high]。日志接口的 limit 都要过一遍，避免一次拉爆。"""
+    number = _as_int(value, low)
+    if number < low:
+        return low
+    if number > high:
+        return high
+    return number
 
 
 def _as_int(value: Any, default: int = 0) -> int:
@@ -359,6 +385,10 @@ class GenieWebApi:
             ("commands", "GET", "_handle_commands", "指令速查表"),
             ("prefs", "GET", "_handle_prefs", "读取界面偏好"),
             ("prefs/save", "POST", "_handle_prefs_save", "保存界面偏好"),
+            ("logs", "GET", "_handle_logs", "运行日志"),
+            ("logs/synths", "GET", "_handle_synth_logs", "合成记录与情感统计"),
+            ("logs/clear", "POST", "_handle_logs_clear", "清空日志缓冲"),
+            ("logs/export", "GET", "_handle_logs_export", "下载日志文本"),
         )
 
     def register(self, context: Any) -> int:
@@ -602,6 +632,7 @@ class GenieWebApi:
                 },
                 "servers": len(engine._server_urls()) if engine else 0,
                 "packs": len(self._list_packs()),
+                "run_log": self._run_log_summary(),
                 "history": list(reversed(self._history[-MAX_HISTORY_ROWS:])),
                 "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
@@ -609,6 +640,33 @@ class GenieWebApi:
         except Exception as exc:
             logger.error("Genie TTS WebUI overview 失败: " + str(exc))
             return self._err("读取总览失败: " + str(exc))
+
+    def _run_log_summary(self) -> Dict[str, Any]:
+        """总览卡片用的日志摘要；没有日志模块时给一份全 0 的占位。"""
+        log = self._run_log()
+        if log is None:
+            return {"available": False, "enabled": False, "attached": False}
+        try:
+            snapshot = log.snapshot()
+        except Exception as exc:
+            logger.debug("Genie TTS WebUI: 读取日志摘要失败: " + str(exc))
+            return {"available": False, "enabled": False, "attached": False}
+        logs = snapshot.get("logs") or {}
+        synths = snapshot.get("synths") or {}
+        return {
+            "available": True,
+            "enabled": bool(snapshot.get("enabled")),
+            "attached": bool(snapshot.get("attached")),
+            "log_size": _as_int(logs.get("size"), 0),
+            "log_total": _as_int(logs.get("total"), 0),
+            "issues": _as_int(logs.get("issues"), 0),
+            "synth_size": _as_int(synths.get("size"), 0),
+            "synth_total": _as_int(synths.get("total"), 0),
+            "failed": _as_int(synths.get("failed"), 0),
+            "skipped": _as_int(synths.get("skipped"), 0),
+            "success_rate": synths.get("success_rate") or 0.0,
+            "avg_elapsed_ms": _as_int(synths.get("avg_elapsed_ms"), 0),
+        }
 
     async def _handle_commands(self):
         groups: List[Dict[str, Any]] = []
@@ -1908,3 +1966,156 @@ class GenieWebApi:
         except Exception as exc:
             return self._err("保存界面偏好失败: " + str(exc))
         return self._ok(payload)
+
+    # ------------------------------------------------------------ 运行日志
+
+    def _run_log(self):
+        """拿插件持有的 RunLog；老版本插件对象上可能没有这个属性。"""
+        return getattr(self.plugin, "run_log", None)
+
+    @staticmethod
+    def _log_dictionaries() -> Dict[str, Any]:
+        """前端渲染 badge / 下拉框要用的全量标签表。"""
+        return {
+            "levels": list(run_log_mod.LEVEL_NAMES),
+            "issue_level": run_log_mod.ISSUE_LEVEL_KEY,
+            "tags": [
+                {"key": key, "label": label}
+                for key, label in run_log_mod.TAG_LABELS.items()
+            ],
+            "sources": [
+                {"key": key, "label": label}
+                for key, label in run_log_mod.SYNTH_SOURCES.items()
+            ],
+            "statuses": [
+                {"key": key, "label": label}
+                for key, label in run_log_mod.SYNTH_STATUSES.items()
+            ],
+        }
+
+    def _log_filters(self, for_synth: bool) -> Dict[str, str]:
+        if for_synth:
+            return {
+                "status": _as_text(self._query("status"), 32),
+                "source": _as_text(self._query("source"), 32),
+                "character": _as_text(self._query("character"), 120),
+                "emotion": _as_text(self._query("emotion"), 120),
+                "session": _as_text(self._query("session"), 200),
+                "search": _as_text(self._query("search"), 200),
+            }
+        return {
+            "level": _as_text(self._query("level"), 32),
+            "tag": _as_text(self._query("tag"), 64),
+            "session": _as_text(self._query("session"), 200),
+            "search": _as_text(self._query("search"), 200),
+        }
+
+    async def _handle_logs(self):
+        log = self._run_log()
+        if log is None:
+            return self._err("当前插件实例没有运行日志模块，请重载插件")
+        try:
+            limit = _clamp_int(
+                _as_int(self._query("limit"), 120), 1, run_log_mod.MAX_CAPACITY
+            )
+            offset = max(0, _as_int(self._query("offset"), 0))
+            filters = self._log_filters(False)
+            items, total = log.buffer.query(limit=limit, offset=offset, **filters)
+            return self._ok(
+                {
+                    "items": items,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "facets": log.buffer.facets(),
+                    "dictionaries": self._log_dictionaries(),
+                    "enabled": bool(log.enabled),
+                    "attached": bool(log.attached),
+                    "filters": filters,
+                    "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+        except Exception as exc:
+            logger.error("Genie TTS WebUI 读取运行日志失败: " + str(exc))
+            return self._err("读取运行日志失败: " + str(exc))
+
+    async def _handle_synth_logs(self):
+        log = self._run_log()
+        if log is None:
+            return self._err("当前插件实例没有运行日志模块，请重载插件")
+        try:
+            limit = _clamp_int(
+                _as_int(self._query("limit"), 40), 1, run_log_mod.MAX_SYNTH_CAPACITY
+            )
+            offset = max(0, _as_int(self._query("offset"), 0))
+            filters = self._log_filters(True)
+            items, total = log.synth.query(limit=limit, offset=offset, **filters)
+            stat_limit = _clamp_int(_as_int(self._query("stats"), 60), 1, 200)
+            return self._ok(
+                {
+                    "items": items,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "facets": log.synth.facets(),
+                    "emotions": log.synth.emotion_stats(stat_limit),
+                    "dictionaries": self._log_dictionaries(),
+                    "enabled": bool(log.enabled),
+                    "filters": filters,
+                    "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+        except Exception as exc:
+            logger.error("Genie TTS WebUI 读取合成记录失败: " + str(exc))
+            return self._err("读取合成记录失败: " + str(exc))
+
+    async def _handle_logs_clear(self):
+        log = self._run_log()
+        if log is None:
+            return self._err("当前插件实例没有运行日志模块，请重载插件")
+        body = await self._read_body()
+        scope = _as_text(body.get("scope"), 16) or "all"
+        if scope not in ("all", "logs", "synths"):
+            return self._err("未知清理范围: " + scope)
+        try:
+            dropped = log.clear(scope)
+        except Exception as exc:
+            return self._err("清空失败: " + str(exc))
+        total = _as_int(dropped.get("logs"), 0) + _as_int(dropped.get("synths"), 0)
+        return self._ok({"scope": scope, "dropped": dropped, "total": total})
+
+    async def _handle_logs_export(self):
+        """裸文本下载。与感情包导出一样不套 envelope。"""
+        log = self._run_log()
+        if log is None:
+            return self._err("当前插件实例没有运行日志模块，请重载插件")
+        kind = _as_text(self._query("kind"), 16) or "logs"
+        if kind not in ("logs", "synths"):
+            return self._err("未知导出类型: " + kind)
+        try:
+            if kind == "synths":
+                limit = _clamp_int(
+                    _as_int(self._query("limit"), 0), 0, run_log_mod.MAX_SYNTH_CAPACITY
+                )
+                text = log.synth.export_text(limit, **self._log_filters(True))
+            else:
+                limit = _clamp_int(
+                    _as_int(self._query("limit"), 0), 0, run_log_mod.MAX_CAPACITY
+                )
+                text = log.buffer.export_text(limit, **self._log_filters(False))
+        except Exception as exc:
+            logger.error("Genie TTS WebUI 导出日志失败: " + str(exc))
+            return self._err("导出日志失败: " + str(exc))
+
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        filename = "genie-tts-" + kind + "-" + stamp + ".txt"
+        return QuartResponse(
+            text,
+            status=200,
+            headers={
+                "Content-Type": "text/plain; charset=utf-8",
+                "Content-Disposition": "attachment; filename=" + filename,
+                "Cache-Control": "no-store",
+            },
+        )
+

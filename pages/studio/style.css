@@ -734,6 +734,58 @@ html[data-density="compact"] .vn-text { min-height: 118px; font-size: 14.5px; li
 .gal-name { font-size: 13px; font-weight: 600; color: var(--text); }
 .gal-hint { margin-top: 2px; font-size: 11px; color: var(--text-mute); }
 
+/* ----------------------------------------------------------- 日志 */
+
+.log-recs { display: flex; flex-direction: column; gap: var(--gap-sm); }
+.log-rec { border: 1px solid var(--line); border-radius: var(--r-md); background: var(--panel-3);
+  overflow: hidden; transition: border-color var(--dur) var(--ease); }
+.log-rec:hover { border-color: var(--accent-line); }
+.log-rec[data-status="failed"] { box-shadow: inset 3px 0 0 var(--danger); }
+.log-rec[data-status="skipped"] { box-shadow: inset 3px 0 0 var(--warn); }
+.log-rec[data-status="pending"] { box-shadow: inset 3px 0 0 var(--accent); }
+.log-rec-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; width: 100%;
+  padding: 10px 13px; border: 0; background: transparent; cursor: pointer; text-align: left;
+  color: inherit; font: inherit; transition: background var(--dur) var(--ease); }
+.log-rec-head:hover { background: var(--accent-soft); }
+.log-rec-head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.log-rec-time { flex: 0 0 auto; color: var(--text-mute); }
+.log-rec-voice { min-width: 0; flex: 1 1 140px; font-family: var(--font-serif); font-size: 13.5px;
+  color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.log-rec-el { flex: 0 0 auto; color: var(--text-dim); }
+.log-rec-caret { flex: 0 0 auto; width: 14px; text-align: center; color: var(--text-mute); }
+.log-rec-text { margin: 0; padding: 0 13px 11px; font-size: 12px; line-height: 1.55;
+  color: var(--text-mute); overflow-wrap: anywhere; }
+.log-rec-body { display: flex; flex-direction: column; gap: var(--gap-sm);
+  padding: 12px 13px 13px; border-top: 1px solid var(--line); }
+
+.log-quote { border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--panel-2); }
+.log-quote[data-tone="accent"] { border-color: var(--accent-line); }
+.log-quote-lab { display: flex; align-items: center; gap: 8px; padding: 6px 9px;
+  border-bottom: 1px solid var(--line); font-family: var(--font-mono); font-size: 10.5px;
+  letter-spacing: .1em; text-transform: uppercase; color: var(--text-mute); }
+.log-quote-text { padding: 9px 11px; max-height: 30vh; overflow-y: auto;
+  font-family: var(--font-serif); font-size: 13px; line-height: 1.7; color: var(--text);
+  white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.log-lines { display: flex; flex-direction: column; border: 1px solid var(--line);
+  border-radius: var(--r-md); background: var(--panel-3); overflow: hidden; }
+.log-line { display: flex; align-items: baseline; gap: 9px; padding: 7px 12px;
+  border-bottom: 1px solid var(--line); }
+.log-line:last-child { border-bottom: 0; }
+.log-line:hover { background: var(--accent-soft); }
+.log-line[data-level="WARNING"] { box-shadow: inset 3px 0 0 color-mix(in srgb, var(--warn) 70%, transparent); }
+.log-line[data-level="ERROR"], .log-line[data-level="CRITICAL"] {
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--danger) 80%, transparent); }
+.log-time { flex: 0 0 auto; color: var(--text-mute); }
+.log-tag { flex: 0 0 auto; min-width: 4.5em; font-size: 11px; color: var(--text-dim); }
+.log-msg { min-width: 0; flex: 1; font-size: 12.5px; line-height: 1.55; color: var(--text);
+  overflow-wrap: anywhere; word-break: break-word; }
+.log-src { flex: 0 0 auto; font-size: 10.5px; color: var(--text-mute); white-space: nowrap; }
+.log-foot { margin: var(--gap-sm) 0 0; }
+
+html[data-density="compact"] .log-line { padding: 4px 10px; }
+html[data-density="compact"] .log-rec-head { padding: 7px 11px; }
+
 /* ----------------------------------------------------------- 滚动条 */
 
 ::-webkit-scrollbar { width: 10px; height: 10px; }

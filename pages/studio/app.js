@@ -356,6 +356,7 @@ var TABS = [
   { id: "servers",  label: "服务器",  ico: "☁" },
   { id: "sessions", label: "会话",    ico: "◉" },
   { id: "commands", label: "指令表",  ico: "⌘" },
+  { id: "logs",     label: "日志",    ico: "▤" },
   { id: "about",    label: "关于",    ico: "ⓘ" }
 ];
 
@@ -369,6 +370,8 @@ var state = {
   config: null,
   sessions: null,
   commands: null,
+  logs: null,
+  synths: null,
   loaded: {},
   busy: {},
   studio: {
@@ -378,7 +381,16 @@ var state = {
   },
   emo: { q: "", ch: "", picked: {}, editing: null, form: null },
   pack: { importText: "", mode: "merge", report: null, note: "", filename: "", dry: true, fileName: "" },
-  cfg: { dirty: {}, needsReload: false, saving: false }
+  cfg: { dirty: {}, needsReload: false, saving: false },
+  /* 日志面板：sub 选子视图，其余是两套互不干扰的服务端筛选条件。
+     lastKey 记最后一次按键时间，自动刷新在打字时会让路，避免输入框被重渲染打断。 */
+  logsUI: {
+    sub: "synths",
+    q: "", level: "", tag: "",
+    sq: "", status: "", source: "", character: "",
+    auto: false, seq: 0, timer: null, debounce: null, lastKey: 0,
+    loading: false, expanded: {}, stats: 60
+  }
 };
 
 function pickedKeys() {
@@ -450,6 +462,17 @@ function tabBadge(id) {
     var n = (s.active_sessions ? s.active_sessions.length : 0) + (s.w_active_sessions ? s.w_active_sessions.length : 0);
     return n ? { text: String(n), tone: null } : null;
   }
+  /* 日志页的角标直接摆「值得看一眼的条数」：优先失败/跳过，其次 WARNING 以上。 */
+  if (id === "logs") {
+    var rl = o.run_log || {};
+    if (!rl.available) return null;
+    var bad = (Number(rl.failed) || 0) + (Number(rl.skipped) || 0);
+    if (bad > 0) return { text: String(bad), tone: "danger" };
+    var iss = Number(rl.issues) || 0;
+    if (iss > 0) return { text: String(iss), tone: "warn" };
+    var size = Number(rl.synth_size) || 0;
+    return size ? { text: String(size), tone: null } : null;
+  }
   return null;
 }
 
@@ -502,7 +525,8 @@ function renderStatus() {
 
 var VIEWS = {
   studio: renderStudio, emotions: renderEmotions, packs: renderPacks, config: renderConfig,
-  servers: renderServers, sessions: renderSessions, commands: renderCommands, about: renderAbout
+  servers: renderServers, sessions: renderSessions, commands: renderCommands,
+  logs: renderLogs, about: renderAbout
 };
 
 var LOADERS = {
@@ -511,7 +535,8 @@ var LOADERS = {
   config: function () { return apiGet("config").then(function (d) { state.config = d; state.cfg.dirty = {}; }); },
   servers: function () { return apiGet("servers").then(function (d) { state.servers = d; }); },
   sessions: function () { return apiGet("sessions").then(function (d) { state.sessions = d; }); },
-  commands: function () { return apiGet("commands").then(function (d) { state.commands = d; }); }
+  commands: function () { return apiGet("commands").then(function (d) { state.commands = d; }); },
+  logs: function () { return fetchLogs(); }
 };
 
 function viewNode(id) { return $("view-" + id); }
@@ -2794,6 +2819,503 @@ function renderCommands() {
   if (!shown) v.appendChild(empty("没有匹配的指令", "换个关键词试试。"));
 }
 
+/* ============================================================ 日志 */
+
+/* 级别 -> badge 色调。DEBUG 用 mute（CSS 里没有这条规则，会退化成默认灰，正合适）。 */
+var LOG_TONES = { DEBUG: "mute", INFO: null, WARNING: "warn", ERROR: "danger", CRITICAL: "danger" };
+var SYNTH_TONES = { ok: "ok", failed: "danger", skipped: "warn", pending: "accent" };
+var LOG_AUTO_MS = 5000;
+
+/* 浏览器里 setTimeout 返回数字，unref 不存在；Node 下跑 harness 时返回 Timeout，
+   unref 掉可以让进程该退出就退出，不被这里的后台轮询拖着不放。 */
+function softTimer(fn, ms) {
+  var t = setTimeout(fn, ms);
+  if (t && typeof t.unref === "function") { try { t.unref(); } catch (e) {} }
+  return t;
+}
+
+function logQuery() {
+  var u = state.logsUI;
+  var q = { limit: 150 };
+  if (u.level) q.level = u.level;
+  if (u.tag) q.tag = u.tag;
+  var s = String(u.q || "").trim();
+  if (s) q.search = s;
+  return q;
+}
+
+function synthQuery() {
+  var u = state.logsUI;
+  var q = { limit: 60, stats: u.stats || 60 };
+  if (u.status) q.status = u.status;
+  if (u.source) q.source = u.source;
+  if (u.character) q.character = u.character;
+  var s = String(u.sq || "").trim();
+  if (s) q.search = s;
+  return q;
+}
+
+/* 两个接口各自兜错：老版本插件没挂 run_log 时，另一半照样能画出来。 */
+function softGet(ep, params) {
+  return apiGet(ep, params).catch(function (e) {
+    return { error: e && e.message ? e.message : String(e) };
+  });
+}
+
+function fetchLogs() {
+  var u = state.logsUI;
+  var seq = ++u.seq;
+  u.loading = true;
+  return Promise.all([softGet("logs", logQuery()), softGet("logs/synths", synthQuery())])
+    .then(function (both) {
+      if (seq !== u.seq) return null;   /* 有更新的请求在飞，这份结果作废 */
+      u.loading = false;
+      state.logs = both[0] || {};
+      state.synths = both[1] || {};
+      return state.logs;
+    });
+}
+
+function reloadLogs(silent) {
+  return fetchLogs().then(function () {
+    renderLogs();
+    if (!silent) toast("日志已刷新", "ok", 1600);
+  }, function (e) { fail(e, "刷新失败"); });
+}
+
+function setLogFilter(key, value) {
+  state.logsUI[key] = value;
+  return fetchLogs().then(function () { renderLogs(); });
+}
+
+/* 重渲染会换掉输入框节点，所以刷新前记住焦点、刷新后按 id 找回去。 */
+function focusedLogSearchId() {
+  try {
+    var a = D.activeElement;
+    if (a && (a.id === "log-q" || a.id === "log-sq")) return a.id;
+  } catch (e) {}
+  return "";
+}
+
+function refocusLogSearch(id) {
+  if (!id) return;
+  try {
+    var node = $(id);
+    if (!node) return;
+    node.focus();
+    try { node.setSelectionRange(node.value.length, node.value.length); } catch (x) {}
+  } catch (e) {}
+}
+
+function logsSearchChanged() {
+  var u = state.logsUI;
+  u.lastKey = Date.now();
+  if (u.debounce) { clearTimeout(u.debounce); u.debounce = null; }
+  u.debounce = softTimer(function () {
+    u.debounce = null;
+    if (state.tab !== "logs") return;
+    var focus = focusedLogSearchId();
+    fetchLogs().then(function () { renderLogs(); refocusLogSearch(focus); });
+  }, 420);
+}
+
+function logsAutoStop() {
+  var u = state.logsUI;
+  if (u.timer) { clearTimeout(u.timer); u.timer = null; }
+}
+
+function logsAutoArm() {
+  var u = state.logsUI;
+  if (u.timer) return;
+  if (!u.auto || state.tab !== "logs") return;
+  u.timer = softTimer(logsAutoTick, LOG_AUTO_MS);
+}
+
+function logsAutoTick() {
+  var u = state.logsUI;
+  u.timer = null;
+  if (!u.auto || state.tab !== "logs") return;   /* 离开日志页就自然停掉 */
+  if (Date.now() - u.lastKey < 3000) { logsAutoArm(); return; }   /* 正在打字，让这一轮 */
+  var focus = focusedLogSearchId();
+  fetchLogs().then(function () { renderLogs(); refocusLogSearch(focus); });
+}
+
+function clearLogs(scope) {
+  var label = scope === "logs" ? "运行日志" : (scope === "synths" ? "合成记录" : "全部日志");
+  confirmModal(
+    "清空" + label + "？",
+    "只清内存里的缓冲，配置、感情库和已经发出去的音频都不动。清完之前的记录就找不回来了。",
+    { danger: true, okText: "清空" }
+  ).then(function (ok) {
+    if (!ok) return;
+    apiPost("logs/clear", { scope: scope }).then(function (d) {
+      var dr = d.dropped || {};
+      toast("已清 " + (d.total || 0) + " 条（日志 " + (dr.logs || 0) + " / 合成 " + (dr.synths || 0) + "）", "ok");
+      state.logsUI.expanded = {};
+      fetchLogs().then(function () { renderLogs(); refreshOverview(); });
+    }).catch(function (e) { fail(e, "清空失败"); });
+  });
+}
+
+function downloadLogs(kind) {
+  var q = kind === "synths" ? synthQuery() : logQuery();
+  q.limit = 0;          /* 0 = 不限条数，导出整个缓冲 */
+  delete q.stats;
+  q.kind = kind;
+  var name = "genie-tts-" + kind + ".txt";
+  try {
+    var task = SDK.download("logs/export", q, name);
+    if (task && typeof task.then === "function") task.then(function () { toast("已下载 " + name, "ok"); }, function (e) { fail(e, "下载失败"); });
+    else toast("已下载 " + name, "ok");
+  } catch (e) { fail(e, "下载失败"); }
+}
+
+/* 复制走本地拼装，不再打一次接口 —— 复制的就是眼前看到的这一屏。 */
+function copyLogText() {
+  var u = state.logsUI;
+  var TAB = String.fromCharCode(9);
+  var lines = [];
+  if (u.sub === "logs") {
+    var items = (state.logs && state.logs.items) || [];
+    if (!items.length) { toast("当前没有可复制的日志", "warn"); return; }
+    items.forEach(function (it) {
+      lines.push(
+        String(it.date || "") + " " + String(it.time || "") + "  " + String(it.level || "") +
+        "  " + String(it.tag_label || "") + "  " + String(it.message || "") +
+        "  (" + String(it.source || "") + ")"
+      );
+    });
+  } else if (u.sub === "stats") {
+    var rows = (state.synths && state.synths.emotions) || [];
+    if (!rows.length) { toast("还没有情感统计可复制", "warn"); return; }
+    lines.push(["角色", "情感", "次数", "成功", "失败", "跳过", "失败率%", "平均耗时ms", "平均字数", "最近一次"].join(TAB));
+    rows.forEach(function (r) {
+      lines.push([
+        r.character || "", r.emotion || "", r.total || 0, r.ok || 0, r.failed || 0,
+        r.skipped || 0, r.fail_rate || 0, r.avg_elapsed_ms || 0, r.avg_chars || 0, r.last_time || ""
+      ].join(TAB));
+    });
+  } else {
+    var recs = (state.synths && state.synths.items) || [];
+    if (!recs.length) { toast("还没有合成记录可复制", "warn"); return; }
+    recs.forEach(function (r) {
+      lines.push(
+        "#" + String(r.id) + " " + String(r.date || "") + " " + String(r.time || "") +
+        " [" + String(r.status_label || "") + "] " + String(r.source_label || "") + " " +
+        String(r.character || "") + " / " + String(r.emotion || "") +
+        (r.emotion_source ? " (" + String(r.emotion_source) + ")" : "") + " " + fmtMs(r.elapsed_ms)
+      );
+      if (r.llm_text) lines.push("  LLM: " + String(r.llm_text));
+      if (r.tts_text) lines.push("  TTS: " + String(r.tts_text));
+      if (r.reason) lines.push("  原因: " + String(r.reason));
+    });
+  }
+  copyText(lines.join(nl()), "已复制 " + lines.length + " 行");
+}
+
+function logQuote(label, text, tone) {
+  var v = text === null || text === undefined ? "" : String(text);
+  if (!v) return null;
+  return h("div", { class: "log-quote", "data-tone": tone || null }, [
+    h("div", { class: "log-quote-lab" }, [
+      h("span", { text: label + " · " + v.length + " 字" }),
+      h("span", { class: "grow" }),
+      btn("复制", { kind: "ghost", sm: true, title: "复制" + label, onclick: function () { copyText(v, "已复制" + label); } })
+    ]),
+    h("div", { class: "log-quote-text", text: v })
+  ]);
+}
+
+/* ---------- 合成记录 ---------- */
+
+function synthRec(r) {
+  var u = state.logsUI;
+  var open = !!u.expanded[r.id];
+  var head = h("button", {
+    type: "button", class: "log-rec-head", "aria-expanded": open ? "true" : "false",
+    onclick: function () { u.expanded[r.id] = !u.expanded[r.id]; renderLogs(); }
+  }, [
+    h("span", { class: "log-rec-time mono", text: String(r.date || "") + " " + String(r.time || "") }),
+    badge(r.status_label || r.status || "—", SYNTH_TONES[r.status] || null),
+    badge(r.source_label || r.source || "—", "mute"),
+    h("span", { class: "log-rec-voice", text: (r.character || "—") + " · " + (r.emotion || "—") }),
+    r.emotion_source ? badge(r.emotion_source, "accent") : null,
+    h("span", { class: "log-rec-el mono", text: fmtMs(r.elapsed_ms) }),
+    h("span", { class: "log-rec-caret", "aria-hidden": "true", text: open ? "▾" : "▸" })
+  ]);
+  var wrap = h("div", { class: "log-rec", "data-status": r.status || null }, head);
+  if (!open) {
+    var brief = r.llm_text || r.tts_text || r.display_text || r.reason || "";
+    if (brief) wrap.appendChild(h("p", { class: "log-rec-text", title: brief, text: shorten(brief, 170) }));
+    return wrap;
+  }
+  var body = h("div", { class: "log-rec-body" });
+  body.appendChild(kv([
+    ["会话", r.session],
+    r.group ? ["群组", r.group] : null,
+    ["语言", r.language],
+    ["工作流", r.workflow],
+    ["情感来源", r.emotion_source],
+    r.candidates && r.candidates.length ? ["候选情感", r.candidates.join(" / ")] : null,
+    ["参考音频", r.ref_audio, "mono"],
+    ["输出方式", r.output_mode],
+    r.audio_path ? ["音频文件", r.audio_path, "mono"] : null,
+    r.audio_bytes ? ["体积 · 时长", fmtBytes(r.audio_bytes) + " · " + fmtSec(r.audio_seconds)] : null,
+    ["分段 · 字数", String(r.chunks || 0) + " 块 · " + String(r.text_chars || 0) + " 字"],
+    r.retries ? ["重试", String(r.retries) + " 次"] : null,
+    r.translated ? ["翻译", "已翻译"] : null,
+    r.truncated ? ["截断", "有截断"] : null,
+    r.reason ? ["原因", r.reason] : null
+  ]));
+  append(body, [
+    logQuote("LLM 原文", r.llm_text),
+    logQuote("送进 TTS 的文本", r.tts_text, "accent"),
+    logQuote("译文", r.translated_text),
+    logQuote("参考文本", r.ref_text)
+  ]);
+  wrap.appendChild(body);
+  return wrap;
+}
+
+function renderSynthList(v, S, sf) {
+  var u = state.logsUI;
+  var items = S.items || [];
+
+  var sqInput = input(u.sq || "", null, {
+    placeholder: "搜原文 / 角色 / 情感 / 会话 / 失败原因…",
+    oninput: function (ev) { u.sq = ev.target.value; logsSearchChanged(); }
+  });
+  sqInput.id = "log-sq";
+  sqInput.classList.add("grow");
+
+  var statusOpts = [{ value: "", label: "全部状态" }, { value: "issue", label: "只看问题（失败 + 跳过）" }];
+  (sf.statuses || []).forEach(function (x) { statusOpts.push({ value: x.key, label: (x.label || x.key) + " " + x.count }); });
+  var sourceOpts = [{ value: "", label: "全部来源" }];
+  (sf.sources || []).forEach(function (x) { sourceOpts.push({ value: x.key, label: (x.label || x.key) + " " + x.count }); });
+  var charOpts = [{ value: "", label: "全部角色" }];
+  (sf.characters || []).forEach(function (x) { charOpts.push({ value: x.key, label: x.key + " " + x.count }); });
+
+  v.appendChild(card({
+    kicker: "FILTER",
+    title: "筛合成记录",
+    body: h("div", { class: "row-tight" }, [
+      sqInput,
+      select(statusOpts, u.status, function (ev) { setLogFilter("status", ev.target.value); }),
+      select(sourceOpts, u.source, function (ev) { setLogFilter("source", ev.target.value); }),
+      select(charOpts, u.character, function (ev) { setLogFilter("character", ev.target.value); })
+    ]),
+    sub: true
+  }));
+
+  if (sf.full_text === false) {
+    v.appendChild(note("当前只留文本摘要（run_log_full_text 关着），长句会被截到 160 字。想核对完整原文，去「配置 → 日志与诊断」把它打开。", "warn"));
+  }
+
+  if (!items.length) {
+    v.appendChild(empty("还没有合成记录", "让 bot 说一句话，或者在工作台点一次合成，这里就会出现记录。"));
+    return;
+  }
+
+  var box = h("div", { class: "log-recs" });
+  items.forEach(function (r) { box.appendChild(synthRec(r)); });
+  v.appendChild(card({
+    kicker: "RECORDS",
+    title: "合成记录 · " + items.length + " 条",
+    desc: "点一行展开：LLM 原话、真正送进 TTS 的文本、命中的情感和来源、参考音频、耗时与失败原因都在里面。",
+    body: box,
+    sub: true
+  }));
+  v.appendChild(h("p", {
+    class: "log-foot tiny dim",
+    text: "当前展示 " + items.length + " 条 · 缓冲 " + (sf.size || 0) + " / " + (sf.capacity || 0) +
+          " · 累计 " + (sf.total || 0) + " 条 · 生成于 " + (S.generated_at || "—")
+  }));
+}
+
+/* ---------- 运行日志 ---------- */
+
+function renderLogList(v, L, lf) {
+  var u = state.logsUI;
+  var items = L.items || [];
+  var dict = L.dictionaries || {};
+
+  var qInput = input(u.q || "", null, {
+    placeholder: "搜正文 / 会话 / 分类…",
+    oninput: function (ev) { u.q = ev.target.value; logsSearchChanged(); }
+  });
+  qInput.id = "log-q";
+  qInput.classList.add("grow");
+
+  var levelOpts = [{ value: "", label: "全部级别" }];
+  if (dict.issue_level) levelOpts.push({ value: dict.issue_level, label: "只看问题 " + (lf.issues || 0) });
+  (lf.levels || []).forEach(function (x) { levelOpts.push({ value: x.key, label: x.key + " " + x.count }); });
+  var tagOpts = [{ value: "", label: "全部分类" }];
+  (lf.tags || []).forEach(function (x) { tagOpts.push({ value: x.key, label: (x.label || x.key) + " " + x.count }); });
+
+  v.appendChild(card({
+    kicker: "FILTER",
+    title: "筛运行日志",
+    body: h("div", { class: "row-tight" }, [
+      qInput,
+      select(levelOpts, u.level, function (ev) { setLogFilter("level", ev.target.value); }),
+      select(tagOpts, u.tag, function (ev) { setLogFilter("tag", ev.target.value); })
+    ]),
+    sub: true
+  }));
+
+  if (!items.length) {
+    v.appendChild(empty("没有匹配的日志", "换个级别或关键词试试，也可能是插件刚重载、还没打出日志。"));
+    return;
+  }
+
+  var box = h("div", { class: "log-lines" });
+  items.forEach(function (it) {
+    box.appendChild(h("div", { class: "log-line", "data-level": it.level || null }, [
+      h("span", { class: "log-time mono", text: it.time || "" }),
+      badge(it.level || "INFO", LOG_TONES[it.level] || null),
+      h("span", { class: "log-tag", text: it.tag_label || it.tag || "" }),
+      h("span", {
+        class: "log-msg",
+        title: String(it.message || "") + (it.session ? "  ·  会话 " + it.session : ""),
+        text: it.message || ""
+      }),
+      h("span", { class: "log-src mono", text: it.source || "" })
+    ]));
+  });
+  v.appendChild(card({
+    kicker: "LINES",
+    title: "运行日志 · " + items.length + " 行",
+    desc: "只收本插件自己打的日志，宿主和其它插件的不会混进来。分类是按正文自动判的。",
+    body: box,
+    sub: true
+  }));
+  v.appendChild(h("p", {
+    class: "log-foot tiny dim",
+    text: "当前展示 " + items.length + " 条 · 缓冲 " + (lf.size || 0) + " / " + (lf.capacity || 0) +
+          " · 累计 " + (lf.total || 0) + " 条 · 生成于 " + (L.generated_at || "—")
+  }));
+}
+
+/* ---------- 情感统计 ---------- */
+
+function renderEmotionStats(v, S) {
+  var u = state.logsUI;
+  var rows = S.emotions || [];
+
+  v.appendChild(card({
+    kicker: "FILTER",
+    title: "统计范围",
+    body: h("div", { class: "row-tight" }, [
+      dim("取前"),
+      select(
+        [{ value: 20, label: "20 组" }, { value: 60, label: "60 组" }, { value: 120, label: "120 组" }, { value: 200, label: "200 组" }],
+        u.stats,
+        function (ev) { setLogFilter("stats", Number(ev.target.value) || 60); }
+      ),
+      dim("按失败率倒序排，失败率相同的看次数。")
+    ]),
+    sub: true
+  }));
+
+  if (!rows.length) {
+    v.appendChild(empty("还没有情感统计", "合成记录攒够几条之后，这里会按「角色 · 情感」聚合出各自的失败率。"));
+    return;
+  }
+
+  var t = table(["角色 · 情感", "次数", "成功", "失败", "跳过", "失败率", "平均耗时", "平均字数", "最近一次", "情感来源"]);
+  rows.forEach(function (r) {
+    var fr = Number(r.fail_rate) || 0;
+    var tone = fr >= 50 ? "danger" : (fr > 0 ? "warn" : "ok");
+    var lastTitle = r.last_reason ? (String(r.last_status || "") + "：" + r.last_reason) : String(r.last_status || "");
+    t.body.appendChild(h("tr", {}, [
+      h("td", {}, h("span", { class: "cell-text", text: (r.character || "—") + " · " + (r.emotion || "—") })),
+      h("td", {}, h("span", { class: "mono", text: String(r.total || 0) })),
+      h("td", {}, h("span", { class: "mono", text: String(r.ok || 0) })),
+      h("td", {}, h("span", { class: "mono", text: String(r.failed || 0) })),
+      h("td", {}, h("span", { class: "mono", text: String(r.skipped || 0) })),
+      h("td", {}, badge(fr + "%", tone)),
+      h("td", {}, h("span", { class: "mono", text: fmtMs(r.avg_elapsed_ms) })),
+      h("td", {}, h("span", { class: "mono", text: String(r.avg_chars || 0) })),
+      h("td", {}, h("span", { class: "nowrap", title: lastTitle, text: r.last_time || "—" })),
+      h("td", {}, h("span", { class: "cell-text", text: r.emotion_source_summary || r.source_summary || "—" }))
+    ]));
+  });
+  v.appendChild(card({
+    kicker: "EMOTIONS",
+    title: "情感成绩单 · " + rows.length + " 组",
+    desc: "失败率高的排最前面。想知道「哪些情感不好」，直接看这张表的头几行。",
+    body: t,
+    sub: true
+  }));
+  v.appendChild(note("失败率 =（失败 + 跳过）/ 已结束次数。跳过多半是文本被清洗空了、或者这个会话没开配音；失败才是合成真炸了 —— 回到「合成记录」点开对应那条看「原因」。", "info"));
+}
+
+/* ---------- 入口 ---------- */
+
+function renderLogs() {
+  var v = clear(viewNode("logs"));
+  var u = state.logsUI;
+  var L = state.logs || {};
+  var S = state.synths || {};
+  var lf = L.facets || {};
+  var sf = S.facets || {};
+
+  var done = (Number(sf.ok) || 0) + (Number(sf.failed) || 0) + (Number(sf.skipped) || 0);
+  var rate = Number(sf.success_rate) || 0;
+  var rateTone = done > 0 ? (rate >= 90 ? "ok" : (rate >= 60 ? "warn" : "danger")) : null;
+  var bad = (Number(sf.failed) || 0) + (Number(sf.skipped) || 0);
+  var issues = Number(lf.issues) || 0;
+
+  var tools = [
+    u.loading ? h("span", { class: "spinner" }) : null,
+    switchBox(u.auto, "自动刷新", function (ev) {
+      u.auto = !!ev.target.checked;
+      if (u.auto) { logsAutoArm(); toast("自动刷新已开，每 5 秒拉一次", "ok", 1600); }
+      else { logsAutoStop(); toast("自动刷新已关", "ok", 1600); }
+    }),
+    btn("刷新", { kind: "soft", sm: true, onclick: function () { reloadLogs(false); } }),
+    btn("复制", { kind: "ghost", sm: true, title: "把当前这一屏复制成文本", onclick: copyLogText }),
+    btn("下载", { kind: "ghost", sm: true, title: "按当前筛选导出整个缓冲", onclick: function () { downloadLogs(u.sub === "logs" ? "logs" : "synths"); } }),
+    btn("清空", { kind: "danger", sm: true, title: "清掉内存里的日志与合成记录", onclick: function () { clearLogs("all"); } })
+  ];
+
+  v.appendChild(card({
+    kicker: "LOGS",
+    title: "运行日志与合成追踪",
+    desc: "每次配音都留一条记录：LLM 原话、真正送进 TTS 的文本、命中的情感和它是谁定的、耗时与失败原因。想知道「哪些情感不好」就翻到情感统计。",
+    tools: tools,
+    body: [
+      h("div", { class: "stat-grid" }, [
+        stat(String(sf.total || 0), "合成总数", null),
+        stat(rate + "%", "成功率", rateTone),
+        stat(String(bad), "失败 + 跳过", bad > 0 ? "danger" : null),
+        stat(fmtMs(sf.avg_elapsed_ms), "平均耗时", null),
+        stat(String(lf.size || 0) + " / " + String(lf.capacity || 0), "日志缓冲", null),
+        stat(String(issues), "警告以上", issues > 0 ? "warn" : null)
+      ]),
+      segment([
+        { value: "synths", label: "合成记录 · " + String(S.total || 0) },
+        { value: "logs", label: "运行日志 · " + String(L.total || 0) },
+        { value: "stats", label: "情感统计 · " + String((S.emotions || []).length) }
+      ], u.sub, function (val) { u.sub = val; renderLogs(); })
+    ]
+  }));
+
+  if (L.error) v.appendChild(note("运行日志读取失败：" + L.error, "danger"));
+  if (S.error) v.appendChild(note("合成记录读取失败：" + S.error, "danger"));
+  if (L.enabled === false || S.enabled === false) {
+    v.appendChild(note("日志采集已关闭，新的动作不会再被记下来。去「配置 → 日志与诊断」打开 enable_run_log。", "warn"));
+  }
+  if (L.attached === false && !L.error) {
+    v.appendChild(note("日志采集器没挂上 AstrBot 的 logger，运行日志会一直是空的；合成记录不受影响。重载一次插件试试。", "warn"));
+  }
+
+  if (u.sub === "logs") renderLogList(v, L, lf);
+  else if (u.sub === "stats") renderEmotionStats(v, S);
+  else renderSynthList(v, S, sf);
+
+  logsAutoArm();
+}
 
 /* ============================================================ 关于 */
 
@@ -2828,6 +3350,10 @@ var ENDPOINTS = [
   ["配置", "POST", "config/save", "写回配置并落盘"],
   ["会话", "GET", "sessions", "活跃会话与群名单"],
   ["会话", "POST", "sessions/toggle", "切换会话 / 群开关"],
+  ["日志", "GET", "logs", "运行日志（支持级别 / 分类 / 关键词）"],
+  ["日志", "GET", "logs/synths", "合成记录与情感统计"],
+  ["日志", "POST", "logs/clear", "清空日志缓冲"],
+  ["日志", "GET", "logs/export", "导出日志纯文本"],
   ["其它", "GET", "commands", "指令速查表"],
   ["其它", "GET", "prefs", "读取界面偏好"],
   ["其它", "POST", "prefs/save", "保存界面偏好"]

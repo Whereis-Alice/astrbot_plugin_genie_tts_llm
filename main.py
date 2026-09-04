@@ -19,20 +19,21 @@ from .emotion_pack import EmotionPackError
 from .emotion_manager import EmotionManager
 from .tts_engine import DEFAULT_MAX_TEXT_LENGTH, TTSEngine, has_pronounceable
 from .external_apis import translate_text
+from .run_log import RunLog
 
 
 @register(
     "astrbot_plugin_genie_tts_llm",
     "Whereis-Alice",
     "一个通过 LLM、翻译和 Genie TTS 实现语音合成的插件，支持主动语音工具",
-    "1.9.4",
+    "1.9.5",
     "https://github.com/Whereis-Alice/astrbot_plugin_genie_tts_llm",
 )
 class GenieTtsLlmPlugin(Star):
     # 会话开关/音色选择的持久化键。AstrBot 的插件 KV 存储按 plugin_id 隔离。
     STATE_KV_KEY = "session_state_v1"
     # 插件版本号：WebUI 总览与感情包元数据都会读它。
-    PLUGIN_VERSION = "1.9.4"
+    PLUGIN_VERSION = "1.9.5"
     # 感情包快照目录名（位于插件数据目录下）。
     PACK_DIR_NAME = "emotion_packs"
     # 能被识别为「导入模式」的 token，真正的语义交给 emotion_pack 归一化。
@@ -64,6 +65,14 @@ class GenieTtsLlmPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        # 运行日志缓冲：越早装上越好，才能抓到后续初始化阶段的日志。
+        self.run_log = RunLog(
+            capacity=self.config.get("run_log_capacity", 500),
+            synth_capacity=self.config.get("run_log_synth_capacity", 200),
+            full_text=self.config.get("run_log_full_text", True),
+            enabled=self.config.get("enable_run_log", True),
+        )
+        self.run_log.attach(logger)
         self.active_sessions: Set[str] = set()
         self.w_active_sessions: Set[str] = set()
         self.active_groups: Set[str] = set()  # 新增：群组级TTS开关
@@ -1314,15 +1323,30 @@ class GenieTtsLlmPlugin(Star):
             yield event.plain_result("❌ 本群组已被禁用语音合成功能。")
             return
 
+        trace = self.run_log.begin_synth(
+            "command",
+            session=event.unified_msg_origin,
+            group=self._normalize_group_id(group_id) or "",
+            character=character_name,
+            emotion=emotion_name,
+            emotion_source="指令指定",
+            tts_text=text_to_synthesize,
+        )
         emotion_data = self.emotion_manager.get_emotion_data(
             character_name, emotion_name
         )
         if not emotion_data:
+            trace.fail("感情不存在")
             yield event.plain_result(
                 f"❌ 未找到角色 '{character_name}' 的感情 '{emotion_name}'。请先使用 /注册感情 指令添加。"
             )
             return
 
+        trace.set(
+            ref_audio=emotion_data.get("ref_audio_path"),
+            ref_text=emotion_data.get("ref_audio_text"),
+            language=emotion_data.get("language"),
+        )
         yield event.plain_result("收到合成请求，正在处理...")
         audio_path = await self.tts_engine.synthesize(
             character_name=character_name,
@@ -1334,9 +1358,11 @@ class GenieTtsLlmPlugin(Star):
         )
 
         if audio_path:
+            trace.ok(audio_path=audio_path, output_mode="仅语音")
             self._remember_last_audio(event.unified_msg_origin, audio_path)
             yield event.chain_result([Comp.Record(file=audio_path)])
         else:
+            trace.fail("TTS合成失败")
             yield event.plain_result(
                 "语音合成失败。\n"
                 "• 若文本里只有标点或表情符号，是不会生成语音的；\n"
@@ -1674,25 +1700,54 @@ class GenieTtsLlmPlugin(Star):
         """
         session_id = event.unified_msg_origin
         group_id = self._normalize_group_id(event.message_obj.group_id)
+        tool_emotion_arg = (emotion_name or "").strip()
         text = text.strip()
 
+        trace = self.run_log.begin_synth(
+            "tool",
+            session=session_id,
+            group=group_id or "",
+            llm_text=text,
+            character=(character_name or "").strip(),
+            emotion=tool_emotion_arg,
+            workflow=self._get_translation_workflow(),
+        )
+
         if self._is_group_blacklisted(group_id):
+            trace.skip("群组黑名单")
             return "当前群组已禁用语音功能，不能直接发送 TTS 语音。"
         if not text:
+            trace.skip("文本为空")
             return "要发送的语音文本为空，请先给出一段需要朗读的内容。"
 
         display_text, tagged_emotion, tagged_translation = self._extract_tool_text_directives(text)
         if not display_text:
+            trace.skip("剥离标签后文本为空")
             return "要发送的语音文本为空，请先给出一段需要朗读的内容。"
         if not emotion_name and tagged_emotion:
             emotion_name = tagged_emotion
 
+        if tool_emotion_arg:
+            emotion_source = "LLM工具指定"
+        elif tagged_emotion:
+            emotion_source = "LLM情感标签"
+        else:
+            emotion_source = "默认情感"
+        trace.set(
+            display_text=display_text,
+            emotion=(emotion_name or "").strip(),
+            emotion_source=emotion_source,
+        )
+
         char_name, resolved_emotion, emotion_data = self._resolve_tts_profile(
             session_id, character_name, emotion_name
         )
+        trace.set(character=char_name or "", emotion=resolved_emotion or "")
         if not char_name or not self.emotion_manager.character_exists(char_name):
+            trace.fail("角色无效")
             return "没有找到可用角色，请先检查默认角色或角色注册情况。"
         if not emotion_data or not resolved_emotion:
+            trace.fail("感情无效")
             if emotion_name:
                 return (
                     f"角色 '{char_name}' 下未找到情感 '{emotion_name}'。"
@@ -1700,6 +1755,11 @@ class GenieTtsLlmPlugin(Star):
                 )
             return f"角色 '{char_name}' 目前没有可用的情感配置。"
 
+        trace.set(
+            ref_audio=emotion_data.get("ref_audio_path"),
+            ref_text=emotion_data.get("ref_audio_text"),
+            language=emotion_data.get("language"),
+        )
         translation_enabled = self.config.get("enable_translation", True)
         translation_workflow = self._get_translation_workflow()
 
@@ -1712,13 +1772,18 @@ class GenieTtsLlmPlugin(Star):
         self._log_translation_result(session_id, display_text, target_text)
 
         if not target_text:
+            trace.fail("译文准备失败")
             return "语音发送失败：用于 TTS 的文本准备失败了，请检查翻译配置或日志。"
+        if target_text != display_text:
+            trace.set(translated_text=target_text, translated=True)
 
         output_mode = self._get_llm_tool_tts_output_mode()
         tts_text, plain_text, output_mode = self._prepare_tts_output_segments(
             display_text, output_mode
         )
+        trace.set(output_mode=output_mode)
         if not tts_text:
+            trace.skip("无可朗读文本")
             return "语音发送失败：没有可用于朗读的文本。"
 
         tts_target_text = target_text
@@ -1735,14 +1800,17 @@ class GenieTtsLlmPlugin(Star):
                 tts_target_text = tts_text
 
             if not tts_target_text:
+                trace.fail("混合模式译文准备失败")
                 return "语音发送失败：混合模式下用于 TTS 的文本准备失败了，请检查翻译配置或日志。"
 
         if not has_pronounceable(tts_target_text):
+            trace.skip("无可朗读字符", tts_text=tts_target_text)
             return (
                 "语音发送失败：这段文本里没有任何可以朗读的字（只有标点或表情符号）。"
                 "请给出包含实际文字的内容再调用一次。"
             )
 
+        trace.set(tts_text=tts_target_text)
         audio_path = await self.tts_engine.synthesize(
             character_name=char_name,
             ref_audio_path=emotion_data["ref_audio_path"],
@@ -1752,6 +1820,7 @@ class GenieTtsLlmPlugin(Star):
             language=emotion_data.get("language"),
         )
         if not audio_path:
+            trace.fail("TTS合成失败")
             return "语音发送失败：TTS 合成没有成功，请检查服务状态或日志。"
         self._remember_last_audio(session_id, audio_path)
 
@@ -1763,11 +1832,13 @@ class GenieTtsLlmPlugin(Star):
             output_mode=output_mode,
         )
         if not ok:
+            trace.fail("主动发送失败", audio_path=audio_path)
             return (
                 (error_message or "语音已经合成成功，但 AstrBot 主动发送失败了。")
                 + "请确认当前会话对应的平台实例仍然在线。"
             )
 
+        trace.ok(audio_path=audio_path)
         self.skip_next_auto_tts_sessions.add(session_id)
         logger.info(
             f"[{session_id}] LLM 工具已主动发送 TTS 语音: {char_name} - {resolved_emotion}"
@@ -2012,20 +2083,36 @@ class GenieTtsLlmPlugin(Star):
         self, text: str, session_id: str
     ) -> Optional[str]:
         """根据当前会话设置合成语音（固定感情模式）"""
+        trace = self.run_log.begin_synth(
+            "context", session=session_id, tts_text=text
+        )
         char_name, emotion_name, emotion_data = self._resolve_tts_profile(session_id)
         if not char_name or not emotion_name:
+            trace.fail("未配置角色或感情")
             logger.error(f"[{session_id}] 未配置默认角色或感情。")
             return None
+        trace.set(
+            character=char_name,
+            emotion=emotion_name,
+            emotion_source="会话固定情感",
+        )
         if not emotion_data:
+            trace.fail("感情不存在")
             logger.error(f"[{session_id}] 找不到感情配置: {char_name} - {emotion_name}")
             return None
 
         # 整段没有可发音字符时直接放弃：Genie 的 t2s 对纯标点段会返回空音频，
         # 旧版本甚至会把参考音频原样拼进结果里。
         if not has_pronounceable(text):
+            trace.skip("无可朗读字符")
             logger.info(f"[{session_id}] 文本没有可朗读字符，已跳过合成: {text[:40]}")
             return None
 
+        trace.set(
+            ref_audio=emotion_data.get("ref_audio_path"),
+            ref_text=emotion_data.get("ref_audio_text"),
+            language=emotion_data.get("language"),
+        )
         audio_path = await self.tts_engine.synthesize(
             character_name=char_name,
             ref_audio_path=emotion_data["ref_audio_path"],
@@ -2034,6 +2121,10 @@ class GenieTtsLlmPlugin(Star):
             session_id_for_log=session_id,
             language=emotion_data.get("language"),
         )
+        if audio_path:
+            trace.ok(audio_path=audio_path)
+        else:
+            trace.fail("TTS合成失败")
         return self._remember_last_audio(session_id, audio_path)
 
     @filter.on_llm_request()
@@ -2220,6 +2311,13 @@ class GenieTtsLlmPlugin(Star):
             return
 
         # --- 开始 TTS 处理流程 ---
+        trace = self.run_log.begin_synth(
+            "auto",
+            session=session_id,
+            group=group_id or "",
+            llm_text=original_text,
+            workflow=translation_workflow,
+        )
 
         audio_path: Optional[str] = None
         target_emotion = None
@@ -2250,8 +2348,15 @@ class GenieTtsLlmPlugin(Star):
                 emotion_source = "会话固定情感" if session_setting else "默认情感"
 
         if not char_name or not self.emotion_manager.character_exists(char_name):
+            trace.fail("角色无效", character=char_name or "")
             self._append_tts_failure_notice(resp, f"TTS失败: 角色'{char_name}'无效")
             return
+        trace.set(
+            character=char_name,
+            candidates=list(
+                self.emotion_manager.emotions_data.get(char_name, {}).keys()
+            ),
+        )
 
         # 确定情感
         if enable_llm_emotion and injected_emotion:
@@ -2294,20 +2399,26 @@ class GenieTtsLlmPlugin(Star):
 
         if not target_text:
             if translation_workflow == "llm_injection":
+                trace.skip("主LLM未返回翻译标签")
                 logger.warning(
                     f"[{session_id}] 本轮自动TTS已触发，但主LLM没有返回 $...$ 翻译标签，"
                     "已跳过语音合成并保留原文本回复。"
                 )
                 return
+            trace.fail("翻译无结果")
             self._append_tts_failure_notice(resp, "TTS失败: 翻译无结果")
             return
+        if target_text != original_text:
+            trace.set(translated_text=target_text, translated=True)
 
         display_text = original_text
         output_mode = self._get_auto_tts_output_mode()
         tts_source_text, plain_display_text, output_mode = self._prepare_tts_output_segments(
             display_text, output_mode
         )
+        trace.set(display_text=display_text, output_mode=output_mode)
         if not tts_source_text:
+            trace.skip("无可朗读文本")
             self._append_tts_failure_notice(resp, "TTS失败: 没有可用于朗读的文本")
             return
 
@@ -2327,6 +2438,7 @@ class GenieTtsLlmPlugin(Star):
                 target_text = tts_source_text
 
             if not target_text:
+                trace.fail("混合模式翻译无结果")
                 self._append_tts_failure_notice(resp, "TTS失败: 混合模式翻译无结果")
                 return
 
@@ -2335,6 +2447,7 @@ class GenieTtsLlmPlugin(Star):
         if not target_emotion:
             target_emotion = self.config.get("default_emotion_name")
             emotion_source = "默认情感兜底"
+        trace.set(emotion=target_emotion or "", emotion_source=emotion_source)
 
         emotion_data = self.emotion_manager.get_emotion_data(char_name, target_emotion)
         if not emotion_data:
@@ -2345,6 +2458,7 @@ class GenieTtsLlmPlugin(Star):
                 char_name, default_emotion
             )
             if not emotion_data:
+                trace.fail("情感无效")
                 self._append_tts_failure_notice(
                     resp, f"TTS失败: 情感'{target_emotion}'无效"
                 )
@@ -2356,6 +2470,13 @@ class GenieTtsLlmPlugin(Star):
                 f"{char_name} - {target_emotion}（原情感: {invalid_emotion}）"
             )
 
+        trace.set(
+            emotion=target_emotion or "",
+            emotion_source=emotion_source,
+            ref_audio=emotion_data.get("ref_audio_path"),
+            ref_text=emotion_data.get("ref_audio_text"),
+            language=emotion_data.get("language"),
+        )
         logger.info(
             f"[{session_id}] 自动TTS情感选择 | 角色: {char_name} | "
             f"情感: {target_emotion} | 来源: {emotion_source or '未标记'} | "
@@ -2365,6 +2486,7 @@ class GenieTtsLlmPlugin(Star):
         # 整段都是标点/表情符号时不要送去合成：不仅浪费一次请求，
         # 还会在正文后面挂一条毫无意义的"合成失败"。
         if not has_pronounceable(target_text):
+            trace.skip("无可朗读字符", tts_text=target_text)
             logger.info(
                 f"[{session_id}] 待合成文本没有可朗读字符，已跳过本轮自动TTS: "
                 f"{target_text[:40]}"
@@ -2372,6 +2494,7 @@ class GenieTtsLlmPlugin(Star):
             return
 
         # 合成语音
+        trace.set(tts_text=target_text)
         audio_path = await self.tts_engine.synthesize(
             character_name=char_name,
             ref_audio_path=emotion_data["ref_audio_path"],
@@ -2382,6 +2505,7 @@ class GenieTtsLlmPlugin(Star):
         )
 
         if audio_path:
+            trace.ok(audio_path=audio_path)
             self._remember_last_audio(session_id, audio_path)
             await self._apply_auto_tts_output_mode(
                 session_id=session_id,
@@ -2392,6 +2516,7 @@ class GenieTtsLlmPlugin(Star):
                 output_mode=output_mode,
             )
         else:
+            trace.fail("TTS合成失败")
             self._append_tts_failure_notice(resp, "TTS合成失败")
 
     @filter.on_decorating_result()
@@ -2420,3 +2545,5 @@ class GenieTtsLlmPlugin(Star):
         await self.tts_engine.terminate()
         await self.http_client.aclose()
         logger.info("LLM TTS 插件已卸载，HTTP客户端已关闭。")
+        # 最后再摘日志 handler，保证上面那条卸载日志也能进缓冲。
+        self.run_log.detach()
