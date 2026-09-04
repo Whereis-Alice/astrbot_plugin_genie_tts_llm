@@ -400,6 +400,7 @@ var TABS = [
   { id: "studio",   label: "工作台",  ico: "◈" },
   { id: "emotions", label: "感情库",  ico: "❀" },
   { id: "packs",    label: "感情包",  ico: "❐" },
+  { id: "favorites", label: "收藏",   ico: "★" },
   { id: "config",   label: "配置",    ico: "⚙" },
   { id: "servers",  label: "服务器",  ico: "☁" },
   { id: "sessions", label: "会话",    ico: "◉" },
@@ -414,6 +415,7 @@ var state = {
   overview: null,
   emotions: null,
   packs: null,
+  favorites: null,
   servers: null,
   config: null,
   sessions: null,
@@ -429,6 +431,17 @@ var state = {
   },
   emo: { q: "", ch: "", picked: {}, editing: null, form: null },
   pack: { importText: "", mode: "merge", report: null, note: "", filename: "", dry: true, fileName: "" },
+  /* 语音收藏：q/ch/emo/src/pinned 是服务端筛选条件，picked 是批量导出的勾选，
+     open 记哪几条展开了播放器，audio 缓存已经取回来的 base64（避免重复请求），
+     nodes 记住每条收藏的 DOM 节点 —— 展开/折叠只换那一条，不整页重画。 */
+  fav: {
+    q: "", ch: "", emo: "", src: "", pinned: false,
+    picked: {}, open: {}, audio: {}, nodes: {}, loadingAudio: {},
+    mode: "merge", report: null, bundleName: "", bundleData: "",
+    upName: "", upData: "", upAlias: "", upChar: "", upEmo: "", upText: "", uploading: false,
+    seq: 0, loading: false, debounce: null, busy: false, rebuilding: false,
+    listBox: null, metaNode: null, statBox: null, exportPicked: null, resetBtn: null
+  },
   cfg: { dirty: {}, needsReload: false, saving: false },
   /* 日志面板：sub 选子视图，其余是两套互不干扰的服务端筛选条件。
      lastKey 记最后一次按键时间，自动刷新在打字时会让路，避免输入框被重渲染打断。
@@ -508,6 +521,10 @@ function tabBadge(id) {
     return { text: String((o.counts && o.counts.emotions) || 0), tone: w > 0 ? "warn" : null };
   }
   if (id === "packs") return { text: String(o.packs || 0), tone: null };
+  if (id === "favorites") {
+    var fv = Number(o.counts && o.counts.favorites) || 0;
+    return fv ? { text: String(fv), tone: null } : null;
+  }
   if (id === "servers") return { text: String(o.servers || 0), tone: null };
   if (id === "commands") return { text: String((o.counts && o.counts.commands) || 0), tone: null };
   if (id === "sessions") {
@@ -577,7 +594,7 @@ function renderStatus() {
 /* ------------------------------------------------------------ 导航 / 加载 */
 
 var VIEWS = {
-  studio: renderStudio, emotions: renderEmotions, packs: renderPacks, config: renderConfig,
+  studio: renderStudio, emotions: renderEmotions, packs: renderPacks, favorites: renderFavorites, config: renderConfig,
   servers: renderServers, sessions: renderSessions, commands: renderCommands,
   logs: renderLogs, about: renderAbout
 };
@@ -585,6 +602,7 @@ var VIEWS = {
 var LOADERS = {
   emotions: function () { return apiGet("emotions").then(function (d) { state.emotions = d; }); },
   packs: function () { return apiGet("packs").then(function (d) { state.packs = d; }); },
+  favorites: function () { return apiGet("favorites", favParams()).then(function (d) { state.favorites = d; }); },
   config: function () { return apiGet("config").then(function (d) { state.config = d; state.cfg.dirty = {}; }); },
   servers: function () { return apiGet("servers").then(function (d) { state.servers = d; }); },
   sessions: function () { return apiGet("sessions").then(function (d) { state.sessions = d; }); },
@@ -1130,7 +1148,10 @@ function renderStudio() {
     ui.resultCard.appendChild(card({
       kicker: "AUDITION", title: "试听",
       desc: "文件名 " + (r.filename || "—") + " · 生成于 " + fmtTime(r.created_at),
-      tools: [btn("复制服务器路径", { sm: true, kind: "ghost", onclick: function () { copyText(r.path, "路径已复制"); } })],
+      tools: [
+        btn("存入收藏", { sm: true, kind: "soft", title: "把这条音频原样收进语音收藏库", onclick: function () { favSaveSynth(r); } }),
+        btn("复制服务器路径", { sm: true, kind: "ghost", onclick: function () { copyText(r.path, "路径已复制"); } })
+      ],
       body: [h("div", { class: "player" }, [h("div", { class: "player-title" }, [h("span", { text: "🔊" }), h("span", { text: shorten(r.text, 60) })])].concat(kids))]
     }));
   }
@@ -2235,6 +2256,986 @@ function renderPacks() {
   }));
 }
 
+/* =====================================================================
+   4) 语音收藏
+
+   页面拆成「壳 + 列表」两层：renderFavorites() 只建壳并记下几个节点引用，
+   之后筛选变化只重画列表和统计条（搜索框节点不动，焦点和光标都不丢），
+   展开 / 折叠只换那一条的 DOM（照 toggleSynthRec 的做法回填滚动），
+   只有导入 / 上传 / 清空 / 重置筛选这类结构性变化才整页重画。
+   ===================================================================== */
+
+/* 文件名里不能出现的字符。反斜杠 / 双引号 / 回车 / 换行 / 制表符 用
+   fromCharCode 拼，省掉一层转义，读起来也不容易看错。 */
+var FAV_BAD_CHARS = "/:*?<>|" + String.fromCharCode(92) + String.fromCharCode(34) +
+  String.fromCharCode(13) + String.fromCharCode(10) + String.fromCharCode(9);
+
+var FAV_TAG_SEPS = " ,，、" + String.fromCharCode(9) + String.fromCharCode(10) + String.fromCharCode(13);
+
+var FAV_UPLOAD_MODES = {
+  auto: "自动（先试协议端上传接口，失败退回文件消息段）",
+  component: "只用文件消息段",
+  onebot_action: "只用协议端上传接口"
+};
+
+function favData() { return state.favorites || {}; }
+function favRows() { return favData().rows || []; }
+
+function favParams() {
+  var f = state.fav;
+  var q = {};
+  var kw = String(f.q || "").trim();
+  if (kw) q.q = kw;
+  if (f.ch) q.character = f.ch;
+  if (f.emo) q.emotion = f.emo;
+  if (f.src) q.source = f.src;
+  if (f.pinned) q.pinned = "1";
+  return q;
+}
+
+function favHasFilter() {
+  var f = state.fav;
+  return !!(String(f.q || "").trim() || f.ch || f.emo || f.src || f.pinned);
+}
+
+function favRowById(id) {
+  var rows = favRows();
+  var key = String(id);
+  for (var i = 0; i < rows.length; i++) {
+    if (String(rows[i].id) === key) return rows[i];
+  }
+  return null;
+}
+
+function favPickedIds() {
+  var box = state.fav.picked;
+  var out = [];
+  for (var k in box) {
+    if (Object.prototype.hasOwnProperty.call(box, k) && box[k]) out.push(k);
+  }
+  return out;
+}
+
+/* 换了一批列表之后，picked / open / audio 里可能还留着已经不在结果里的 id。
+   不摘掉的话「已勾选 N 条」会虚高，批量导出还会报「没找到这条收藏」。 */
+function favPrune() {
+  var f = state.fav;
+  var live = {};
+  favRows().forEach(function (r) { live[String(r.id)] = true; });
+  ["picked", "open", "audio", "loadingAudio", "nodes"].forEach(function (name) {
+    var box = f[name] || {};
+    for (var k in box) {
+      if (!Object.prototype.hasOwnProperty.call(box, k)) continue;
+      if (!live[k]) delete box[k];
+    }
+  });
+}
+
+function favSplitTags(v) {
+  var raw = String(v === null || v === undefined ? "" : v);
+  var out = [];
+  var cur = "";
+  for (var i = 0; i < raw.length; i++) {
+    var ch = raw.charAt(i);
+    if (FAV_TAG_SEPS.indexOf(ch) >= 0) {
+      if (cur) { out.push(cur); cur = ""; }
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/* 下载用的文件名。safeName() 会强行补 .json，收藏是音频，所以自己过一遍。 */
+function favFileName(r) {
+  var base = String(r.alias || r.text || ("收藏-" + String(r.id || ""))).trim();
+  var out = "";
+  for (var i = 0; i < base.length && out.length < 40; i++) {
+    var ch = base.charAt(i);
+    out += FAV_BAD_CHARS.indexOf(ch) >= 0 ? "_" : ch;
+  }
+  out = out.replace(new RegExp("^[._ ]+"), "").replace(new RegExp("[. ]+$"), "");
+  if (!out) out = "genie-voice";
+  return out + (r.suffix || ".wav");
+}
+
+function favStamp() {
+  var d = new Date();
+  function p(x) { return (x < 10 ? "0" : "") + x; }
+  return String(d.getFullYear()) + p(d.getMonth() + 1) + p(d.getDate()) + "-" +
+         p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+}
+
+function favOpts(list, allLabel) {
+  var out = [{ value: "", label: allLabel }];
+  (list || []).forEach(function (x) { out.push({ value: String(x), label: String(x) }); });
+  return out;
+}
+
+function favSourceOpts() {
+  var out = [{ value: "", label: "全部来源" }];
+  (favData().sources || []).forEach(function (s) {
+    out.push({ value: s.value, label: String(s.label || s.value) + " · " + String(s.count || 0) });
+  });
+  return out;
+}
+
+function favModeOpts() {
+  var list = favData().modes || [];
+  if (!list.length) {
+    return [{ value: "merge", label: "合并" }, { value: "overwrite", label: "覆盖" }, { value: "replace", label: "整库替换" }];
+  }
+  return list.map(function (m) { return { value: m.value, label: m.label || m.value }; });
+}
+
+function favUploadModeLabel(v) {
+  var key = String(v || "auto");
+  return FAV_UPLOAD_MODES[key] || key;
+}
+
+/* ---------- 取数 / 落库 ---------- */
+
+/* 筛选变化走这条路：只重画列表和统计条，页面骨架（搜索框、拖放区、上传表单）
+   原地不动。seq 防串场 —— 连打关键词时旧请求回得比新请求晚是常事。 */
+function favFetch(silent) {
+  var f = state.fav;
+  var seq = ++f.seq;
+  f.loading = true;
+  favSyncMeta();
+  return apiGet("favorites", favParams()).then(function (d) {
+    if (seq !== f.seq) return null;
+    f.loading = false;
+    state.favorites = d || {};
+    state.loaded.favorites = true;
+    favPrune();
+    favSyncStats();
+    favRenderList();
+    favSyncMeta();
+    if (!silent) toast("收藏已刷新", "ok", 1600);
+    return d;
+  }, function (e) {
+    if (seq !== f.seq) return null;
+    f.loading = false;
+    favSyncMeta();
+    return fail(e, "读取收藏失败");
+  });
+}
+
+function favDebounce() {
+  var f = state.fav;
+  if (f.debounce) { clearTimeout(f.debounce); f.debounce = null; }
+  f.debounce = softTimer(function () {
+    f.debounce = null;
+    if (state.tab !== "favorites") return;
+    favFetch(true);
+  }, 320);
+}
+
+/* 写操作的返回值本身就带一份最新列表，直接换掉即可，不用再多请求一次。
+   轻量版只刷列表 / 统计 / 计数条。 */
+function favApply(d, msg, tone) {
+  state.favorites = d || {};
+  state.loaded.favorites = true;
+  favPrune();
+  if (state.tab === "favorites") {
+    favSyncStats();
+    favRenderList();
+    favSyncMeta();
+  }
+  refreshOverview();
+  if (msg) toast(msg, tone || "ok");
+}
+
+/* 结构性变化（导入 / 上传 / 清空 / 重置筛选）才整页重画，走 keepScroll 保住视口。 */
+function favApplyFull(d, msg, tone) {
+  state.favorites = d || {};
+  state.loaded.favorites = true;
+  favPrune();
+  if (state.tab === "favorites") keepScroll(viewNode("favorites"), renderFavorites);
+  refreshOverview();
+  if (msg) toast(msg, tone || "ok");
+}
+
+/* 「重置筛选」：条件清光之后上面那几个输入框也得回到初始态，
+   所以拉完新数据整页重画一次；顺手把还没落地的防抖请求掐掉，省一次空跑。 */
+function favResetFilter() {
+  var f = state.fav;
+  f.q = ""; f.ch = ""; f.emo = ""; f.src = ""; f.pinned = false;
+  if (f.debounce) { clearTimeout(f.debounce); f.debounce = null; }
+  favFetch(true).then(function () {
+    if (state.tab === "favorites") keepScroll(viewNode("favorites"), renderFavorites);
+  });
+}
+
+/* ---------- 试听 ---------- */
+
+function favLoadAudio(key) {
+  var f = state.fav;
+  key = String(key);
+  if (f.loadingAudio[key]) return;
+  f.loadingAudio[key] = true;
+  apiGet("favorites/audio", { id: key }).then(function (d) {
+    f.audio[key] = d || {};
+  }, function (e) {
+    f.audio[key] = { error: e && e.message ? e.message : String(e) };
+  }).then(function () {
+    delete f.loadingAudio[key];
+    if (f.open[key] && state.tab === "favorites") favSwap(key);
+  });
+}
+
+function favToggle(id) {
+  var f = state.fav;
+  var key = String(id);
+  f.open[key] = !f.open[key];
+  if (f.open[key] && !f.audio[key]) favLoadAudio(key);
+  favSwap(key);
+}
+
+/* 展开 / 折叠只换这一条的节点，再按同一行在视口里的位置回填滚动。
+   整页重画的话 clear() 一清文档就变短，浏览器会把 scrollTop 夹掉 ——
+   用户看到的就是「点一下展开，页面自己往上跳」。 */
+function favSwap(key) {
+  var f = state.fav;
+  key = String(key);
+  var r = favRowById(key);
+  var old = f.nodes[key];
+  if (!r || !old || !old.parentNode || !attachedSafe(old)) { favRenderList(); return; }
+
+  var before = 0;
+  var measured = false;
+  try {
+    if (typeof old.getBoundingClientRect === "function") { before = old.getBoundingClientRect().top; measured = true; }
+  } catch (e1) {}
+
+  var next = favEntryNode(r);
+  try {
+    old.parentNode.insertBefore(next, old);
+    old.parentNode.removeChild(old);
+  } catch (e2) { favRenderList(); return; }
+
+  if (measured) {
+    try {
+      var delta = next.getBoundingClientRect().top - before;
+      if (delta) scrollToSafe(scrollYSafe() + delta);
+    } catch (e3) {}
+  }
+  try {
+    var nh = next.querySelector(".fav-head");
+    if (nh && typeof nh.focus === "function") {
+      try { nh.focus({ preventScroll: true }); } catch (e4) { nh.focus(); }
+    }
+  } catch (e5) {}
+}
+
+/* ---------- 一条收藏 ---------- */
+
+function favEntryNode(r) {
+  var f = state.fav;
+  var key = String(r.id);
+  var open = !!f.open[key];
+
+  var pick = h("input", {
+    type: "checkbox", checked: !!f.picked[key],
+    "aria-label": "勾选这条收藏",
+    onchange: function (e) {
+      if (e.target.checked) f.picked[key] = true;
+      else delete f.picked[key];
+      favSyncMeta();
+    }
+  });
+
+  var head = h("button", {
+    type: "button", class: "fav-head", "aria-expanded": open ? "true" : "false",
+    onclick: function () { favToggle(key); }
+  }, [
+    h("span", { class: "fav-idx mono", text: "#" + String(r.index || "?") }),
+    h("span", { class: "fav-name", text: r.alias || shorten(r.text, 44) || ("收藏 " + key) }),
+    h("span", { class: "fav-dur mono", text: r.duration_human || "—" }),
+    h("span", { class: "fav-caret", "aria-hidden": "true", text: open ? "▾" : "▸" })
+  ]);
+
+  var sub = h("div", { class: "fav-sub", text: [
+    (r.character || "未标角色") + " · " + (r.emotion || "未标感情"),
+    r.bytes_human || "—",
+    r.created_text || "—"
+  ].join(" · ") });
+
+  var box = h("div", {
+    class: "fav", "data-fav": key,
+    "data-pinned": r.pinned ? "true" : null,
+    "data-open": open ? "true" : null,
+    "data-lossy": r.lossy ? "true" : null
+  }, [
+    h("label", { class: "fav-pick", title: "勾选后可以批量导出" }, pick),
+    h("div", { class: "fav-main" }, [head, sub])
+  ]);
+  f.nodes[key] = box;
+
+  var chips = h("div", { class: "fav-chips" });
+  if (r.pinned) chips.appendChild(chip("置顶", "chip-accent"));
+  chips.appendChild(chip(r.source_label || r.source || "—", r.lossy ? "chip-warn" : "chip-mono"));
+  chips.appendChild(chip(String(r.suffix || ".wav").replace(".", "").toUpperCase(), "chip-mono"));
+  if (r.play_count) chips.appendChild(chip("发过 " + r.play_count + " 次", "chip-mono"));
+  (r.tags || []).forEach(function (t) { chips.appendChild(chip(String(t))); });
+  box.appendChild(chips);
+
+  box.appendChild(h("div", { class: "btnrow" }, [
+    btn(open ? "收起" : "试听", { sm: true, kind: "soft", onclick: function () { favToggle(key); } }),
+    btn("下载", { sm: true, onclick: function () { favDownload(r); } }),
+    btn("编辑", { sm: true, kind: "ghost", onclick: function () { openFavEdit(r); } }),
+    btn(r.pinned ? "取消置顶" : "置顶", { sm: true, kind: "ghost", onclick: function () { favPin(r); } }),
+    btn("删除", { sm: true, kind: "danger", onclick: function () { favDelete(r); } })
+  ]));
+
+  if (!open) {
+    if (r.text) box.appendChild(h("p", { class: "fav-text", title: r.text, text: shorten(r.text, 150) }));
+    return box;
+  }
+
+  var body = h("div", { class: "fav-body" });
+  var a = f.audio[key];
+  if (!a) {
+    if (!f.loadingAudio[key]) favLoadAudio(key);   /* 兜底：状态被裁掉过就重新拉一次 */
+    body.appendChild(h("div", { class: "row-tight" }, [h("span", { class: "spinner" }), dim("正在读取音频…")]));
+  } else if (a.error) {
+    body.appendChild(note(String(a.error), "danger"));
+  } else if (a.audio_base64) {
+    var au = h("audio", { controls: true, preload: "metadata" });
+    au.src = "data:" + (a.mime || r.mime || "audio/wav") + ";base64," + a.audio_base64;
+    body.appendChild(h("div", { class: "player" }, [
+      h("div", { class: "player-title" }, [
+        h("span", { text: "🔊" }),
+        h("span", { text: shorten(r.alias || r.text || key, 60) })
+      ]),
+      au
+    ]));
+  } else {
+    body.appendChild(note(
+      "音频体积超过网页内联上限（" + fmtBytes(favData().max_inline_bytes || 0) +
+      "），浏览器里没法直接播。点「下载」拿原文件，或者在聊天里发 /发收藏 " + String(r.index || key) + "。",
+      "warn"));
+  }
+
+  body.appendChild(kv([
+    ["台词", r.text || "—"],
+    ["角色 · 感情", (r.character || "—") + " · " + (r.emotion || "—")],
+    ["时长 · 体积", (r.duration_human || "—") + " · " + (r.bytes_human || "—")],
+    ["来源", (r.source_label || r.source || "—") +
+      (r.lossy ? "（协议端回捞，已统一转成 WAV，音质取决于原始编码）" : "（原始文件逐字节复制，无损）")],
+    ["所属会话", r.session_id || "—"],
+    ["收藏时间", r.created_text || "—"],
+    ["最近发送", r.last_played_text ? (r.last_played_text + " · 共 " + (r.play_count || 0) + " 次") : "还没发过"],
+    ["指纹 sha256", r.sha256 || "—", "mono"],
+    ["内部 id", r.id, "mono"]
+  ]));
+
+  body.appendChild(h("div", { class: "btnrow" }, [
+    btn("导出这一条", { sm: true, kind: "soft", onclick: function () { favExport([key], r.alias || r.text || key); } }),
+    btn("复制发送指令", { sm: true, kind: "ghost", onclick: function () { copyText("/发收藏 " + String(r.index || key), "指令已复制"); } }),
+    btn("复制台词", { sm: true, kind: "ghost", disabled: !r.text, onclick: function () { copyText(r.text, "台词已复制"); } })
+  ]));
+  box.appendChild(body);
+  return box;
+}
+
+function favEmptyNode() {
+  if (favHasFilter()) {
+    return empty("没有匹配的收藏", "换个关键词，或者点上面的「重置筛选」看全部。");
+  }
+  return empty("收藏夹还是空的",
+    "在聊天里引用一条 bot 发过的语音，回一句 /语音收藏 就能原样存进来；也可以在下面直接上传音频文件。");
+}
+
+function favFillList(box) {
+  var f = state.fav;
+  f.nodes = {};
+  clear(box);
+  var rows = favRows();
+  if (!rows.length) { box.appendChild(favEmptyNode()); return; }
+  rows.forEach(function (r) { box.appendChild(favEntryNode(r)); });
+}
+
+function favRenderList() {
+  var f = state.fav;
+  if (f.listBox && attachedSafe(f.listBox)) {
+    keepScroll(f.listBox, function () { favFillList(f.listBox); });
+    return;
+  }
+  /* 节点引用对不上（比如刚从别的分区切回来）就整页重画一次，
+     rebuilding 挡住递归：renderFavorites 只调 favFillList，不会再回到这里。 */
+  if (state.tab !== "favorites" || f.rebuilding) return;
+  f.rebuilding = true;
+  try { keepScroll(viewNode("favorites"), renderFavorites); }
+  finally { f.rebuilding = false; }
+}
+
+function favSyncStats() {
+  var f = state.fav;
+  if (!f.statBox) return;
+  var d = favData();
+  var s = d.stats || {};
+  var cfg = d.config || {};
+  var count = Number(s.count) || 0;
+  var limit = Number(s.limit) || Number(cfg.limit) || 0;
+  var ratio = limit ? count / limit : 0;
+  clear(f.statBox);
+  append(f.statBox, [
+    stat(String(count) + (limit ? " / " + limit : ""), "已收藏", ratio >= 0.9 ? "warn" : (count ? "accent" : null)),
+    stat(String(Number(s.pinned) || 0), "置顶", Number(s.pinned) ? "ok" : null),
+    stat(s.total_bytes_human || fmtBytes(s.total_bytes || 0), "占用空间"),
+    stat(s.total_duration_human || "0s", "总时长"),
+    stat(String(Object.keys(s.characters || {}).length), "涉及角色"),
+    stat(String(Number(s.lossy) || 0), "协议端回捞", Number(s.lossy) ? "warn" : null)
+  ]);
+}
+
+function favSyncMeta() {
+  var f = state.fav;
+  var d = favData();
+  var picked = favPickedIds().length;
+  if (f.metaNode) {
+    var bits = ["命中 " + (Number(d.matched) || favRows().length) + " 条"];
+    if (d.truncated) bits.push("只显示前 " + (Number(d.max_rows) || 400) + " 条");
+    if (picked) bits.push("已勾选 " + picked + " 条");
+    if (f.loading) bits.push("正在刷新…");
+    if (d.generated_at) bits.push("数据时间 " + d.generated_at);
+    f.metaNode.textContent = bits.join(" · ");
+  }
+  if (f.exportPicked) {
+    f.exportPicked.disabled = !picked;
+    f.exportPicked.textContent = picked ? ("导出勾选 " + picked + " 条") : "导出勾选";
+  }
+  /* 筛选条件是在列表局部刷新时改的，工具条不会跟着重画，
+     所以「重置筛选」的可用态得在这里补上一笔。 */
+  if (f.resetBtn) f.resetBtn.disabled = !favHasFilter();
+}
+
+/* ---------- 动作 ---------- */
+
+var FAV_MODE_HINTS = {
+  merge: "合并：包里有、库里没有的加进来；同一条（按内部 id）已经存在就跳过，现有收藏一条都不动。",
+  overwrite: "覆盖：同一条已经存在时用包里的版本替换掉，其余按合并处理。",
+  replace: "整库替换：先清空现在的收藏（音频文件真删），再把包里的内容整份写进去。不可撤销。"
+};
+
+function favDownload(r) {
+  var name = favFileName(r);
+  try {
+    var task = SDK.download("favorites/download", { id: r.id }, name);
+    if (task && typeof task.then === "function") {
+      task.then(function () { toast("已下载 " + name, "ok"); }, function (e) { fail(e, "下载失败"); });
+    } else {
+      toast("已下载 " + name, "ok");
+    }
+  } catch (e) { fail(e, "下载失败"); }
+}
+
+/* ids 传 null / 空数组就是导出全部。label 只用来把提示语说得具体点。 */
+function favExport(ids, label) {
+  var many = !!(ids && ids.length);
+  var params = many ? { ids: ids.join(",") } : {};
+  var name = "genie-voices-" + favStamp() + ".zip";
+  var tip = label ? ("已导出「" + shorten(label, 24) + "」")
+                  : (many ? ("已导出 " + ids.length + " 条") : "已导出全部收藏");
+  try {
+    var task = SDK.download("favorites/export", params, name);
+    if (task && typeof task.then === "function") {
+      task.then(function () { toast(tip + " · " + name, "ok"); }, function (e) { fail(e, "导出失败"); });
+    } else {
+      toast(tip + " · " + name, "ok");
+    }
+  } catch (e) { fail(e, "导出失败"); }
+}
+
+function favPin(r) {
+  apiPost("favorites/update", { id: r.id, pinned: !r.pinned })
+    .then(function (d) { favApply(d, r.pinned ? "已取消置顶" : "已置顶，清空收藏时默认保留"); })
+    .catch(function (e) { fail(e, "操作失败"); });
+}
+
+function favLabel(r) {
+  return r.alias || shorten(r.text, 30) || ("#" + String(r.index || r.id));
+}
+
+function favDelete(r) {
+  var name = favLabel(r);
+  confirmModal("删除收藏「" + name + "」？",
+    "音频文件会从收藏目录里删掉，无法找回。参考音频和 emotions.json 不受影响。",
+    { danger: true, okText: "删除" })
+    .then(function (ok) {
+      if (!ok) return;
+      apiPost("favorites/delete", { id: r.id }).then(function (d) {
+        delete state.fav.picked[String(r.id)];
+        delete state.fav.open[String(r.id)];
+        favApply(d, "已删除「" + name + "」");
+      }).catch(function (e) { fail(e, "删除失败"); });
+    });
+}
+
+function favClear() {
+  var keep = true;
+  openModal({
+    kicker: "DANGER",
+    title: "清空收藏夹？",
+    danger: true,
+    okText: "清空",
+    body: [
+      note("收藏目录里的音频文件会被真删掉，无法找回。建议先点「导出全部」留一份收藏包。", "danger"),
+      switchBox(true, "保留置顶的收藏", function (e) { keep = e.target.checked; })
+    ]
+  }).then(function (ok) {
+    if (!ok) return;
+    apiPost("favorites/clear", { confirm: true, keep_pinned: keep }).then(function (d) {
+      state.fav.picked = {};
+      state.fav.open = {};
+      favApplyFull(d, "已清空 " + (Number(d.removed) || 0) + " 条" + (keep ? "（置顶的留着）" : "（含置顶）"));
+    }).catch(function (e) { fail(e, "清空失败"); });
+  });
+}
+
+/* ---------- 编辑 ---------- */
+
+/* 改名走 favorites/rename（后端会做重名去重），其余字段走 favorites/update。
+   两个接口都会回一份最新列表，所以串起来跑、只用最后一份即可。 */
+function openFavEdit(r) {
+  var d = favData();
+  var ctl = {};
+  ctl.alias = input(r.alias || "", null, { placeholder: "给这条起个好记的名字" });
+  ctl.character = input(r.character || "", null, { placeholder: "角色名，例如 kisaki" });
+  ctl.emotion = input(r.emotion || "", null, { placeholder: "感情名，例如 悲伤" });
+  ctl.text = textarea(r.text || "", null, { rows: 3, placeholder: "这条语音念的台词，写上之后关键词能搜到" });
+  ctl.tags = input((r.tags || []).join(" "), null, { mono: true, placeholder: "标签，空格 / 逗号 / 顿号分隔" });
+  var chars = d.characters || [];
+  var emos = d.emotions || [];
+  formModal({
+    kicker: "EDIT",
+    title: "编辑收藏 · " + favLabel(r),
+    okText: "保存",
+    body: [
+      field({ label: "名字", control: ctl.alias, desc: "重名会自动加后缀；/发收藏 可以直接用这个名字，不用记序号" }),
+      h("div", { class: "grid-2" }, [
+        field({ label: "角色", control: ctl.character, desc: chars.length ? ("已有：" + shorten(chars.join(" / "), 60)) : "" }),
+        field({ label: "感情", control: ctl.emotion, desc: emos.length ? ("已有：" + shorten(emos.join(" / "), 60)) : "" })
+      ]),
+      field({ label: "台词", control: ctl.text }),
+      field({ label: "标签", control: ctl.tags, desc: "最多留 8 个，用来分组；筛选框里搜标签也能命中" })
+    ],
+    onOk: function () {
+      var alias = String(ctl.alias.value || "").trim();
+      if (!alias) { toast("名字不能为空", "warn"); return false; }
+      return {
+        alias: alias,
+        character: String(ctl.character.value || "").trim(),
+        emotion: String(ctl.emotion.value || "").trim(),
+        text: String(ctl.text.value || "").trim(),
+        tags: favSplitTags(ctl.tags.value)
+      };
+    }
+  }).then(function (form) {
+    if (form) favSaveEdit(r, form);
+  });
+}
+
+function favSaveEdit(r, form) {
+  var jobs = [];
+  if (form.alias !== String(r.alias || "")) {
+    jobs.push({ ep: "favorites/rename", body: { id: r.id, alias: form.alias } });
+  }
+  var fields = { id: r.id };
+  var dirty = false;
+  if (form.character !== String(r.character || "")) { fields.character = form.character; dirty = true; }
+  if (form.emotion !== String(r.emotion || "")) { fields.emotion = form.emotion; dirty = true; }
+  if (form.text !== String(r.text || "")) { fields.text = form.text; dirty = true; }
+  if (form.tags.join(" ") !== (r.tags || []).join(" ")) { fields.tags = form.tags; dirty = true; }
+  if (dirty) jobs.push({ ep: "favorites/update", body: fields });
+  if (!jobs.length) { toast("没有改动", "info", 1800); return; }
+  var chain = Promise.resolve(null);
+  jobs.forEach(function (job) {
+    chain = chain.then(function () { return apiPost(job.ep, job.body); });
+  });
+  chain.then(function (d) { favApply(d, "已保存修改"); }).catch(function (e) { fail(e, "保存失败"); });
+}
+
+/* 工作台试听区的「存入收藏」。后端只认 temp_audio_dir 里的路径，
+   临时音频只留 30 分钟，过期了会明确回一句「重新合成一次」。 */
+function favSaveSynth(r) {
+  if (!r || !r.path) { toast("先合成一条再收藏", "warn"); return; }
+  apiPost("favorites/save-synth", {
+    path: r.path, alias: "",
+    character: r.character, emotion: r.emotion, text: r.text
+  }).then(function (d) {
+    favApply(d,
+      d.duplicate ? "这条已经在收藏夹里了（指纹一致，没有重复存）" : "已存入收藏 · 聊天里 /收藏列表 就能看到",
+      d.duplicate ? "warn" : "ok");
+  }).catch(function (e) { fail(e, "收藏失败"); });
+}
+
+/* ---------- 导入 / 上传 ---------- */
+
+function favImportRun() {
+  var f = state.fav;
+  if (!f.bundleData) { toast("先拖入一个收藏包 .zip", "warn"); return; }
+  var go2 = function () {
+    f.busy = true;
+    renderFavorites();
+    apiPost("favorites/import", { data: f.bundleData, mode: f.mode })
+      .then(function (d) {
+        var rep = d.report || {};
+        f.busy = false;
+        f.report = rep;
+        f.bundleData = "";
+        f.bundleName = "";
+        f.picked = {};
+        f.open = {};
+        favApplyFull(d, "导入完成 · " + (rep.summary_text || ""),
+          (Number(rep.invalid) || 0) ? "warn" : "ok");
+      })
+      .catch(function (e) { f.busy = false; renderFavorites(); fail(e, "导入收藏包失败"); });
+  };
+  if (f.mode !== "replace") { go2(); return; }
+  confirmModal("确认用整库替换模式导入？", FAV_MODE_HINTS.replace + " 建议先点「导出全部」留一份。",
+    { danger: true, okText: "我确认，替换" })
+    .then(function (ok) { if (ok) go2(); });
+}
+
+function favUploadRun() {
+  var f = state.fav;
+  if (!f.upData) { toast("先选一个音频文件", "warn"); return; }
+  f.uploading = true;
+  renderFavorites();
+  apiPost("favorites/upload", {
+    data: f.upData,
+    filename: f.upName,
+    alias: f.upAlias,
+    character: f.upChar,
+    emotion: f.upEmo,
+    text: f.upText
+  }).then(function (d) {
+    f.uploading = false;
+    f.upData = "";
+    f.upName = "";
+    f.upAlias = "";
+    f.upChar = "";
+    f.upEmo = "";
+    f.upText = "";
+    favApplyFull(d,
+      d.duplicate ? "这条音频已经在收藏夹里了（指纹一致，没有重复存）" : "已上传并收藏",
+      d.duplicate ? "warn" : "ok");
+  }).catch(function (e) { f.uploading = false; renderFavorites(); fail(e, "上传失败"); });
+}
+
+/* 收藏包的导入报告：这里的 added / updated / … 都是数字，和感情包 reportCard
+   里那套数组结构不一样，所以单独写一张卡，别去复用。 */
+function favReportCard(rep) {
+  function num(k) { return Number(rep[k]) || 0; }
+  return card({
+    sub: true,
+    kicker: "REPORT",
+    title: "收藏包导入报告",
+    tools: rep.summary_text ? [btn("复制摘要", { sm: true, kind: "ghost", onclick: function () { copyText(rep.summary_text, "摘要已复制"); } })] : null,
+    body: [
+      h("div", { class: "stat-grid" }, [
+        stat(num("added"), "新增", num("added") ? "ok" : null),
+        stat(num("updated"), "覆盖", num("updated") ? "accent" : null),
+        stat(num("skipped"), "跳过", num("skipped") ? "warn" : null),
+        stat(num("removed"), "清空", num("removed") ? "danger" : null),
+        stat(num("evicted"), "超量淘汰", num("evicted") ? "warn" : null),
+        stat(num("invalid"), "无效", num("invalid") ? "danger" : null)
+      ]),
+      note(rep.summary_text || "没有任何变化", num("invalid") ? "warn" : "ok"),
+      kv([
+        ["模式", rep.mode_label || rep.mode || "—"],
+        ["库内总数", num("total") + " 条"]
+      ])
+    ]
+  });
+}
+
+/* ---------- 二进制拖放区 ---------- */
+
+/* dropZone() 走 readAsText，只能吃 JSON。收藏包是 zip、上传的是音频，都得走
+   readAsDataURL 再把 base64 段切出来 —— 后端 _decode_upload 认的就是纯 base64。 */
+function dropZoneBinary(opts) {
+  opts = opts || {};
+  var limit = Number(opts.limit) || 4 * 1024 * 1024;
+  var picker = h("input", { type: "file", accept: opts.accept || null });
+  var zone = h("div", { class: "drop", tabindex: "0", role: "button" }, [
+    h("b", { text: opts.title || "把文件拖进来" }),
+    h("span", { text: opts.desc || ("或点这里选文件 · 上限 " + fmtBytes(limit)) }),
+    picker
+  ]);
+  function read(file) {
+    if (!file) return;
+    if (file.size > limit) {
+      toast("文件 " + fmtBytes(file.size) + " 超过上限 " + fmtBytes(limit) + "，已拒绝", "danger");
+      return;
+    }
+    var fr = new FileReader();
+    fr.onload = function () {
+      var s = String(fr.result || "");
+      var i = s.indexOf("base64,");
+      opts.onFile(i >= 0 ? s.slice(i + 7) : "", file.name, file.size);
+    };
+    fr.onerror = function () { toast("读取文件失败", "danger"); };
+    try { fr.readAsDataURL(file); } catch (e) { fail(e, "读取文件失败"); }
+  }
+  zone.addEventListener("click", function (e) { if (e.target !== picker) picker.click(); });
+  zone.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); picker.click(); }
+  });
+  picker.addEventListener("change", function () {
+    read(picker.files && picker.files[0]);
+    picker.value = "";
+  });
+  ["dragenter", "dragover"].forEach(function (n) {
+    zone.addEventListener(n, function (e) { e.preventDefault(); e.stopPropagation(); zone.dataset.over = "true"; });
+  });
+  ["dragleave", "dragend"].forEach(function (n) {
+    zone.addEventListener(n, function (e) { e.preventDefault(); zone.dataset.over = "false"; });
+  });
+  zone.addEventListener("drop", function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    zone.dataset.over = "false";
+    var dt = e.dataTransfer;
+    if (dt && dt.files && dt.files.length) read(dt.files[0]);
+  });
+  return zone;
+}
+
+/* ---------- 页面 ---------- */
+
+/* base64 长度换回原始字节数：4 个字符 = 3 字节，末尾的 = 是补位。
+   只用来给「已读入 xx」这行提示，不做校验。 */
+function favB64Bytes(s) {
+  var n = String(s || "").length;
+  if (!n) return 0;
+  var pad = 0;
+  if (s.charAt(n - 1) === "=") pad += 1;
+  if (n > 1 && s.charAt(n - 2) === "=") pad += 1;
+  return Math.max(0, Math.floor(n / 4) * 3 - pad);
+}
+
+function renderFavorites() {
+  var v = clear(viewNode("favorites"));
+  var f = state.fav;
+  var d = favData();
+  var cfg = d.config || {};
+  var upLimit = Number(d.max_upload_bytes) || 10 * 1024 * 1024;
+
+  /* 整页重画会把上一轮的节点全丢掉，这四个引用必须跟着换新的，
+     否则 favSyncStats / favSyncMeta / favRenderList 会往已经摘掉的旧节点上写。 */
+  f.statBox = h("div", { class: "stat-grid" });
+  f.metaNode = h("p", { class: "fav-meta" });
+  f.listBox = h("div", { class: "fav-list" });
+  f.exportPicked = btn("导出勾选", { sm: true, kind: "soft", onclick: function () { favExport(favPickedIds(), ""); } });
+  f.resetBtn = btn("重置筛选", { sm: true, kind: "ghost", disabled: !favHasFilter(), onclick: favResetFilter });
+
+  /* ===== 总开关关掉时的提示 ===== */
+  /* 网页这一侧照样能用：后端 _vault_ready 不看 enabled，只有聊天里的指令会被拦。 */
+  if (d.enabled === false) {
+    v.appendChild(card({
+      kicker: "OFF",
+      title: "聊天里的收藏指令已关闭",
+      body: [
+        note("配置项「启用语音收藏」是关的，/语音收藏、/发收藏、/语音转文件 在聊天里不会响应。这个页面不受影响，照样能看、能改、能导出。", "warn"),
+        h("div", { class: "btnrow" }, [
+          btn("去配置页打开", { kind: "soft", onclick: function () { go("config"); } })
+        ])
+      ]
+    }));
+  }
+
+  /* ===== 概览 ===== */
+  v.appendChild(card({
+    kicker: "VAULT",
+    title: "语音收藏夹",
+    desc: "在聊天里引用一条 bot 发过的语音，回一句 /语音收藏 就原样存进来 —— 逐字节复制，不重新编码，音质无损。",
+    tools: [
+      btn("刷新", { sm: true, kind: "ghost", onclick: function () { favFetch(false); } }),
+      btn("导出全部", { sm: true, kind: "soft", onclick: function () { favExport(null, ""); } }),
+      btn("清空", { sm: true, kind: "danger", onclick: function () { favClear(); } })
+    ],
+    body: [
+      f.statBox,
+      kv([
+        ["收藏目录", d.directory || "—", "mono"],
+        ["容量上限", (Number(cfg.limit) || 0) + " 条 / " + (Number(cfg.max_mb) || 0) + " MB（超了按时间从旧到新淘汰，置顶的不动）"],
+        ["发文件方式", favUploadModeLabel(cfg.upload_mode)],
+        ["支持格式", (d.suffixes || []).join(" "), "mono"]
+      ])
+    ]
+  }));
+
+  /* ===== 筛选 ===== */
+  /* 这一块的节点在筛选变化时不重建，所以搜索框的焦点和光标位置都不会丢。 */
+  v.appendChild(card({
+    sub: true,
+    kicker: "FILTER",
+    title: "筛选",
+    body: [
+      h("div", { class: "grid-3" }, [
+        field({ label: "关键词", control: input(f.q, null, {
+          placeholder: "名字 / 台词 / 角色 / 感情 / 标签",
+          oninput: function (e) { f.q = e.target.value; favDebounce(); }
+        }) }),
+        field({ label: "角色", control: select(favOpts(d.characters, "全部角色"), f.ch, function (e) {
+          f.ch = e.target.value; favFetch(true);
+        }) }),
+        field({ label: "感情", control: select(favOpts(d.emotions, "全部感情"), f.emo, function (e) {
+          f.emo = e.target.value; favFetch(true);
+        }) })
+      ]),
+      h("div", { class: "grid-2" }, [
+        field({
+          label: "来源",
+          desc: "「协议端回捞」是从聊天消息里重新拉回来的，可能经过一次转码；其余三种都是原始文件。",
+          control: select(favSourceOpts(), f.src, function (e) { f.src = e.target.value; favFetch(true); })
+        }),
+        field({
+          label: "置顶",
+          control: switchBox(f.pinned, "只看置顶的收藏", function (e) { f.pinned = e.target.checked; favFetch(true); })
+        })
+      ])
+    ]
+  }));
+
+  /* ===== 列表 ===== */
+  v.appendChild(card({
+    kicker: "VOICES",
+    title: "收藏列表",
+    desc: "点标题展开就能直接试听。序号和聊天里 /收藏列表 显示的一致，可以拿去 /发收藏。",
+    tools: [
+      f.exportPicked,
+      btn("全选本页", { sm: true, kind: "ghost", onclick: function () {
+        favRows().forEach(function (r) { f.picked[String(r.id)] = true; });
+        favRenderList();
+        favSyncMeta();
+      } }),
+      btn("清空勾选", { sm: true, kind: "ghost", onclick: function () {
+        f.picked = {};
+        favRenderList();
+        favSyncMeta();
+      } }),
+      f.resetBtn
+    ],
+    body: [f.metaNode, f.listBox]
+  }));
+
+  if (f.report) v.appendChild(favReportCard(f.report));
+
+  /* ===== 导入 / 上传 ===== */
+  var bundleZone = dropZoneBinary({
+    accept: ".zip",
+    limit: upLimit,
+    title: "把收藏包 .zip 拖进来",
+    desc: "或点这里选文件 · 上限 " + fmtBytes(upLimit),
+    onFile: function (b64, name, size) {
+      f.bundleData = b64;
+      f.bundleName = name || "";
+      f.report = null;
+      renderFavorites();
+      toast("已读入 " + (name || "收藏包") + "（" + fmtBytes(size) + "）", "ok");
+    }
+  });
+
+  var audioZone = dropZoneBinary({
+    accept: (d.suffixes || []).join(","),
+    limit: upLimit,
+    title: "把音频文件拖进来",
+    desc: "支持 " + ((d.suffixes || []).join(" ") || "常见音频格式") + " · 上限 " + fmtBytes(upLimit),
+    onFile: function (b64, name, size) {
+      f.upData = b64;
+      f.upName = name || "";
+      if (!f.upAlias) {
+        var raw = String(name || "");
+        var dot = raw.lastIndexOf(".");
+        f.upAlias = dot > 0 ? raw.slice(0, dot) : raw;
+      }
+      renderFavorites();
+      toast("已读入 " + (name || "音频") + "（" + fmtBytes(size) + "）", "ok");
+    }
+  });
+
+  var importBtn = btn(f.busy ? "处理中…" : "导入收藏包", {
+    kind: "primary",
+    disabled: !!f.busy || !f.bundleData,
+    onclick: function () { favImportRun(); }
+  });
+  var uploadBtn = btn(f.uploading ? "上传中…" : "上传并收藏", {
+    kind: "primary",
+    disabled: !!f.uploading || !f.upData,
+    onclick: function () { favUploadRun(); }
+  });
+
+  /* 上传表单这四个输入框的 oninput 只写状态、不重渲染 —— 一重渲染就把
+     正在打字的输入框连焦点带光标一起换掉了。按钮的 disabled 只跟文件有关，
+     这四个字段全是选填，不用跟着刷。 */
+  var upFields = [
+    ["名字", f.upAlias, "留空就拿文件名当名字", function (e) { f.upAlias = e.target.value; }],
+    ["角色", f.upChar, "选填，填了能按角色筛", function (e) { f.upChar = e.target.value; }],
+    ["感情", f.upEmo, "选填，填了能按感情筛", function (e) { f.upEmo = e.target.value; }],
+    ["台词", f.upText, "选填，填了关键词能搜到", function (e) { f.upText = e.target.value; }]
+  ].map(function (row) {
+    return field({
+      label: row[0],
+      desc: row[2],
+      control: input(row[1], null, { placeholder: row[2], oninput: row[3] })
+    });
+  });
+
+  v.appendChild(card({
+    kicker: "IO",
+    title: "导入 / 上传",
+    desc: "收藏包就是一个 zip：里面是原始音频文件加一份索引，换机器、换服务器直接搬走。",
+    body: [
+      h("div", { class: "io-panel" }, [
+        h("div", {}, [
+          field({
+            label: "收藏包（.zip）",
+            tag: f.bundleName ? chip(shorten(f.bundleName, 28), "chip-mono chip-accent") : null,
+            control: bundleZone,
+            hint: f.bundleData ? ("已读入 " + fmtBytes(favB64Bytes(f.bundleData))) : "还没选文件"
+          }),
+          field({
+            label: "合并模式",
+            control: segment(favModeOpts(), f.mode, function (val) { f.mode = val; renderFavorites(); })
+          }),
+          note(FAV_MODE_HINTS[f.mode] || "", f.mode === "replace" ? "danger" : "info"),
+          h("div", { class: "btnrow" }, [
+            importBtn,
+            f.bundleData ? btn("丢掉这个包", { kind: "ghost", onclick: function () {
+              f.bundleData = ""; f.bundleName = ""; renderFavorites();
+            } }) : null
+          ].filter(Boolean))
+        ]),
+        h("div", {}, [
+          field({
+            label: "上传单个音频",
+            tag: f.upName ? chip(shorten(f.upName, 28), "chip-mono chip-accent") : null,
+            control: audioZone,
+            hint: f.upData ? ("已读入 " + fmtBytes(favB64Bytes(f.upData))) : "还没选文件"
+          }),
+          h("div", { class: "grid-2" }, upFields),
+          h("div", { class: "btnrow" }, [
+            uploadBtn,
+            f.upData ? btn("丢掉这个文件", { kind: "ghost", onclick: function () {
+              f.upData = ""; f.upName = ""; renderFavorites();
+            } }) : null
+          ].filter(Boolean))
+        ])
+      ])
+    ]
+  }));
+
+  /* 壳搭完了再一次性把列表和统计填进去。这里直接调 favFillList，
+     不走 favRenderList —— 后者在引用对不上时会回头再调 renderFavorites。 */
+  favFillList(f.listBox);
+  favSyncStats();
+  favSyncMeta();
+}
 
 /* ============================================================ 配置 */
 

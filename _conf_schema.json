@@ -466,5 +466,34 @@
     "hint": "开启时合成记录保存 LLM 原文与送进 TTS 的完整文本（单条上限 4000 字），方便逐字核对。关闭后只保留前 160 字摘要，省内存。改完需要重载插件生效。",
     "type": "bool",
     "default": true
+  },
+  "enable_voice_favorites": {
+    "title": "语音收藏",
+    "description": "引用语音即可收藏",
+    "hint": "开启后可以引用我发过的语音，用 /语音收藏 把原始 WAV 字节级拷进收藏夹长期保存（临时音频 30 分钟后会被清理，收藏不会）。同时开放 /收藏列表、/发收藏、/收藏文件、/收藏导出、/收藏导入 等指令与 WebUI 工作台的「语音收藏」页。关闭后这些指令只回一句提示，已存的收藏不会被删。",
+    "type": "bool",
+    "default": true
+  },
+  "voice_favorite_limit": {
+    "title": "收藏条数上限",
+    "description": "超出淘汰最旧的",
+    "hint": "收藏夹最多保留多少条语音，超出后自动淘汰最旧的一条（置顶的永不淘汰）。淘汰会连音频文件一起删掉。范围 1~5000，默认 200。",
+    "type": "int",
+    "default": 200
+  },
+  "voice_favorite_max_mb": {
+    "title": "单条收藏大小上限",
+    "description": "单位 MB",
+    "hint": "单条语音允许收藏的最大体积（MB）。超过就拒绝收藏，避免有人把大文件塞进来撑爆磁盘。一条 10 秒的 24kHz 单声道 WAV 约 0.5MB，默认 32MB 足够宽松。最小 1。",
+    "type": "int",
+    "default": 32
+  },
+  "voice_file_upload_mode": {
+    "title": "语音转文件通道",
+    "description": "auto / component / onebot_action",
+    "hint": "/语音转文件、/收藏文件、/收藏导出 把音频当文件外发时走哪条通道。auto（默认）先试 AstrBot 的文件消息段，失败再退回 OneBot 的 upload_group_file / upload_private_file；component 只用消息段（跨机需要配 callback_api_base）；onebot_action 只用 OneBot 上传接口（要求 AstrBot 与协议端能访问同一个文件路径）。NapCat / LLOneBot / SnowLuma 都支持后者。",
+    "type": "string",
+    "default": "auto",
+    "options": ["auto", "component", "onebot_action"]
   }
 }

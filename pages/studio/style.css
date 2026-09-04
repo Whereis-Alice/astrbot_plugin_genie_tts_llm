@@ -621,6 +621,47 @@ html[data-density="compact"] .vn-text { min-height: 118px; font-size: 14.5px; li
 .pack-sub { margin-top: 3px; font-size: 11.5px; color: var(--text-mute); }
 .pack-chips { display: flex; flex-wrap: wrap; gap: 5px; }
 
+/* --------------------------------------------------------- 语音收藏 */
+
+/* 一条收藏是个 flex 容器：勾选框 / 主体（标题+副行）/ 标签 / 按钮排一行，
+   台词和展开后的详情靠 flex-basis:100% 独占整行。左侧内投影当状态旗：
+   有损（协议端回捞）先写、置顶后写 —— 同权重后者胜，置顶的旗色优先。 */
+.fav-meta { margin: 0 0 var(--gap-sm); font-family: var(--font-mono); font-size: 11px;
+  letter-spacing: .03em; color: var(--text-mute); }
+.fav-list { display: flex; flex-direction: column; gap: var(--gap-sm); }
+.fav { display: flex; flex-wrap: wrap; align-items: center; gap: 8px var(--gap-sm);
+  padding: 11px 13px; border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--panel-3); transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease); }
+.fav:hover { border-color: var(--accent-line); }
+.fav[data-lossy="true"] { box-shadow: inset 3px 0 0 var(--warn); }
+.fav[data-pinned="true"] { box-shadow: inset 3px 0 0 var(--accent); }
+.fav[data-open="true"] { border-color: var(--accent-line); background: var(--panel-2); }
+.fav-pick { flex: 0 0 auto; display: grid; place-items: center; width: 22px; height: 22px;
+  border-radius: var(--r-sm); cursor: pointer; transition: background var(--dur) var(--ease); }
+.fav-pick:hover { background: var(--accent-soft); }
+.fav-pick input { cursor: pointer; accent-color: var(--accent); }
+.fav-main { min-width: 0; flex: 1 1 240px; }
+.fav-head { display: flex; align-items: center; gap: 8px; width: 100%; padding: 1px 0;
+  border: 0; border-radius: var(--r-sm); background: transparent; cursor: pointer;
+  text-align: left; color: inherit; font: inherit; }
+.fav-head:hover .fav-name { color: var(--accent); }
+.fav-head:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.fav-idx { flex: 0 0 auto; font-size: 11px; color: var(--text-mute); }
+.fav-name { min-width: 0; flex: 1 1 auto; font-family: var(--font-serif); font-size: 13.5px;
+  color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  transition: color var(--dur) var(--ease); }
+.fav-dur { flex: 0 0 auto; font-size: 11px; color: var(--text-dim); }
+.fav-caret { flex: 0 0 auto; width: 14px; text-align: center; color: var(--text-mute); }
+.fav-sub { margin-top: 3px; font-size: 11.5px; color: var(--text-mute);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fav-chips { flex: 0 1 auto; display: flex; flex-wrap: wrap; gap: 5px; }
+.fav > .btnrow { flex: 0 0 auto; margin-left: auto; }
+.fav-text { flex: 1 1 100%; margin: 0; font-size: 12px; line-height: 1.55;
+  color: var(--text-mute); overflow-wrap: anywhere; }
+.fav-body { flex: 1 1 100%; display: flex; flex-direction: column; gap: var(--gap-sm);
+  padding-top: 11px; border-top: 1px solid var(--line); }
+.fav-body .player { margin-top: 0; }
+
 /* ----------------------------------------------------------- 服务器 */
 
 .srv-list { display: flex; flex-direction: column; gap: var(--gap-sm); }

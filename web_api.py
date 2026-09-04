@@ -30,9 +30,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from astrbot.api import logger
 
+from . import audio_compat
 from . import emotion_pack
 from . import run_log as run_log_mod
+from . import voice_vault
 from .emotion_pack import EmotionPackError
+from .voice_vault import VoiceVaultError
 from .tts_engine import (
     BYTES_PER_SAMPLE,
     CHANNELS,
@@ -78,6 +81,40 @@ MAX_SYNTH_TEXT_LENGTH = 1500
 MAX_PREVIEW_TEXT_LENGTH = 4000
 MAX_PACK_FILES = 300
 MAX_HISTORY_ROWS = 40
+
+# 收藏列表一次最多回多少行。收藏上限本身是 200（可调到更大），一次全推也没多少，
+# 但留个闸门，别让某天有人把上限改成 5000 之后前端直接卡死。
+MAX_FAVORITE_ROWS = 400
+# 上传收藏包 / 上传音频时允许的解码后体积。Quart 默认 body 上限 16MB，
+# base64 会膨胀 4/3，所以这里只敢收 10MB，前端也按同一个数拦一次。
+MAX_UPLOAD_BUNDLE_BYTES = 10 * 1024 * 1024
+
+# 收藏音频回放/下载用的 MIME。收藏库允许的后缀见 voice_vault.ALLOWED_SUFFIXES。
+AUDIO_MIME_BY_SUFFIX: Dict[str, str] = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".flac": "audio/flac",
+    ".m4a": "audio/mp4",
+    ".amr": "audio/amr",
+    ".silk": "application/octet-stream",
+}
+
+# 收藏来源的中文说明。plugin = 插件自己合成的原始 wav，platform = 从协议端捞回来的
+# （经过一次有损编码），import = 从收藏包导入，upload = 网页直接上传。
+VAULT_SOURCE_LABELS: Dict[str, str] = {
+    "plugin": "本机合成",
+    "platform": "协议端回捞",
+    "import": "收藏包导入",
+    "upload": "网页上传",
+}
+
+VAULT_MODE_LABELS: Dict[str, str] = {
+    "merge": "合并（同名跳过）",
+    "overwrite": "覆盖（同名以包为准）",
+    "replace": "整库替换（先清空）",
+}
 
 
 # --------------------------------------------------------------------- 主题
@@ -204,6 +241,17 @@ CONFIG_GROUPS: Tuple[Tuple[str, str, str, Tuple[str, ...]], ...] = (
         ),
     ),
     (
+        "favorites",
+        "语音收藏",
+        "把 bot 发过的语音无损存进收藏夹，支持指令与 WebUI 双向管理、导入导出。",
+        (
+            "enable_voice_favorites",
+            "voice_favorite_limit",
+            "voice_favorite_max_mb",
+            "voice_file_upload_mode",
+        ),
+    ),
+    (
         "diagnostics",
         "日志与诊断",
         "内存里的运行日志与合成轨迹，供「日志」页排查情感选得好不好。",
@@ -251,11 +299,23 @@ COMMAND_TABLE: Tuple[Dict[str, str], ...] = (
     {"group": "感情包", "usage": "/感情包", "alias": "感情包列表", "desc": "列出服务器上保存的感情包快照"},
     {"group": "感情包", "usage": "/感情包保存 [文件名]", "alias": "", "desc": "把当前感情库存成一份快照"},
     {"group": "感情包", "usage": "/感情包恢复 文件名 [模式] [试运行]", "alias": "", "desc": "从快照恢复感情库（试运行只预演）"},
+    {"group": "收藏", "usage": "/语音收藏 [名字]", "alias": "收藏语音", "desc": "引用一条语音 → 无损存进收藏夹"},
+    {"group": "收藏", "usage": "/收藏列表 [关键词] [页码]", "alias": "语音收藏列表", "desc": "分页查看收藏，带序号方便后续引用"},
+    {"group": "收藏", "usage": "/发收藏 序号|名字", "alias": "播放收藏", "desc": "把收藏里的语音重新发出来"},
+    {"group": "收藏", "usage": "/收藏文件 序号|名字", "alias": "收藏转文件", "desc": "把收藏里的语音以文件形式发出"},
+    {"group": "收藏", "usage": "/语音转文件", "alias": "语音存文件", "desc": "引用一条语音 → 直接转成可下载文件"},
+    {"group": "收藏", "usage": "/删收藏 序号|名字", "alias": "删除收藏", "desc": "删掉一条收藏"},
+    {"group": "收藏", "usage": "/收藏改名 序号 新名字", "alias": "", "desc": "给收藏改个好找的名字"},
+    {"group": "收藏", "usage": "/收藏备注 序号 [文本]", "alias": "", "desc": "补写或清空收藏的文本备注"},
+    {"group": "收藏", "usage": "/收藏置顶 序号", "alias": "", "desc": "置顶/取消置顶（置顶不会被容量淘汰）"},
+    {"group": "收藏", "usage": "/收藏导出 [序号…]", "alias": "导出收藏", "desc": "打包成 zip 发出（省略序号导出全部）"},
+    {"group": "收藏", "usage": "/收藏导入 [模式]", "alias": "导入收藏", "desc": "上传或引用 zip 收藏包并入库"},
+    {"group": "收藏", "usage": "/收藏清空 [确认] [含置顶]", "alias": "清空收藏", "desc": "清空收藏（默认保留置顶，需要确认词）"},
     {"group": "诊断", "usage": "/tts-status", "alias": "语音状态", "desc": "查看开关、音色、队列与服务器状态"},
     {"group": "诊断", "usage": "/tts-help", "alias": "语音帮助", "desc": "显示指令帮助"},
 )
 
-COMMAND_GROUP_ORDER = ("开关", "音色", "合成", "感情包", "诊断")
+COMMAND_GROUP_ORDER = ("开关", "音色", "合成", "感情包", "收藏", "诊断")
 
 
 # ------------------------------------------------------------------ 小工具
@@ -375,6 +435,22 @@ class GenieWebApi:
             ("packs/delete", "POST", "_handle_pack_delete", "删除感情包快照"),
             ("packs/restore", "POST", "_handle_pack_restore", "从快照恢复感情库"),
             ("packs/download", "GET", "_handle_pack_download", "下载感情包快照"),
+            ("favorites", "GET", "_handle_favorites", "读取语音收藏"),
+            ("favorites/audio", "GET", "_handle_favorite_audio", "读取收藏音频"),
+            ("favorites/rename", "POST", "_handle_favorite_rename", "收藏改名"),
+            ("favorites/update", "POST", "_handle_favorite_update", "修改收藏信息"),
+            ("favorites/delete", "POST", "_handle_favorite_delete", "删除收藏"),
+            ("favorites/clear", "POST", "_handle_favorite_clear", "清空收藏"),
+            ("favorites/download", "GET", "_handle_favorite_download", "下载收藏音频"),
+            ("favorites/export", "GET", "_handle_favorite_export", "导出收藏包"),
+            ("favorites/import", "POST", "_handle_favorite_import", "导入收藏包"),
+            ("favorites/upload", "POST", "_handle_favorite_upload", "上传音频到收藏"),
+            (
+                "favorites/save-synth",
+                "POST",
+                "_handle_favorite_save_synth",
+                "把试听结果存进收藏",
+            ),
             ("servers", "GET", "_handle_servers", "探测 TTS 服务器"),
             ("synthesize", "POST", "_handle_synthesize", "合成试听"),
             ("preview", "POST", "_handle_preview", "分段与停顿预览"),
@@ -545,6 +621,7 @@ class GenieWebApi:
     # ------------------------------------------------------------ 总览
 
     async def _handle_overview(self):
+        await self._ensure_vault_loaded()
         try:
             rows, warnings = self._emotion_rows()
             characters = self._characters()
@@ -568,6 +645,7 @@ class GenieWebApi:
                     "commands": len(COMMAND_TABLE),
                     "themes": len(THEMES),
                     "endpoints": self._registered,
+                    "favorites": self._favorite_count(),
                 },
                 "stats": {
                     "requests": _as_int(stats.get("requests"), 0),
@@ -1864,8 +1942,12 @@ class GenieWebApi:
                     "emotion": _as_text(profile.get("emotion")),
                     "w_character": _as_text(w_profile.get("character")),
                     "w_emotion": _as_text(w_profile.get("emotion")),
-                    "has_last_audio": session_id
-                    in (getattr(plugin, "last_audio_paths", {}) or {}),
+                    "has_last_audio": bool(
+                        getattr(plugin, "has_sent_voice", lambda _s: False)(session_id)
+                    ),
+                    "sent_voices": _as_int(
+                        getattr(plugin, "sent_voice_count", lambda _s: 0)(session_id), 0
+                    ),
                 }
             )
 
@@ -1918,6 +2000,570 @@ class GenieWebApi:
             logger.warning("Genie TTS WebUI: 持久化会话状态失败: " + str(exc))
 
         return await self._handle_sessions()
+
+    # ------------------------------------------------------------ 语音收藏
+
+    def _vault(self) -> Any:
+        return getattr(self.plugin, "voice_vault", None)
+
+    def _favorites_enabled(self) -> bool:
+        return _as_bool(self.plugin.config.get("enable_voice_favorites", True), True)
+
+    def _favorite_count(self) -> int:
+        """总览用的计数。只读内存，磁盘加载交给 _ensure_vault_loaded。"""
+        vault = self._vault()
+        if vault is None:
+            return 0
+        try:
+            return int(vault.count())
+        except Exception:
+            return 0
+
+    async def _ensure_vault_loaded(self) -> None:
+        """总览里顺手把索引读进内存；load() 自带缓存，之后都是空转。"""
+        vault = self._vault()
+        if vault is None:
+            return
+        try:
+            await vault.load()
+        except Exception as exc:
+            logger.debug("Genie TTS WebUI: 预读收藏库失败: " + str(exc))
+
+    async def _vault_ready(self) -> Tuple[Any, str]:
+        """同步容量配置并确保索引已加载。返回 (收藏库, 错误信息)。"""
+        vault = self._vault()
+        if vault is None:
+            return None, "当前插件版本没有语音收藏库，请更新插件后重试。"
+        try:
+            self.plugin._sync_vault_config()
+        except Exception as exc:
+            logger.debug("Genie TTS WebUI: 同步收藏容量失败: " + str(exc))
+        try:
+            await vault.load()
+        except Exception as exc:
+            logger.error("Genie TTS WebUI: 读取收藏库失败: " + str(exc))
+            return None, "读取收藏库失败: " + str(exc)
+        return vault, ""
+
+    @staticmethod
+    def _vault_time(value: Any) -> str:
+        seconds = _as_int(value, 0)
+        if seconds <= 0:
+            return ""
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(seconds))
+        except (OSError, OverflowError, ValueError):
+            return ""
+
+    def _vault_row(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        """把一条收藏摊平成前端表格能直接渲染的行。"""
+        entry_id = _as_text(entry.get("id"))
+        index = _as_int(entry.get("index"), 0)
+        if not index:
+            try:
+                index = int(self.plugin._favorite_index(entry_id))
+            except Exception:
+                index = 0
+        size = _as_int(entry.get("size"), 0)
+        duration_ms = _as_int(entry.get("duration_ms"), 0)
+        source = _as_text(entry.get("source")) or "plugin"
+        suffix = (_as_text(entry.get("suffix")) or ".wav").lower()
+        return {
+            "id": entry_id,
+            "index": index,
+            "alias": _as_text(entry.get("alias")),
+            "character": _as_text(entry.get("character")),
+            "emotion": _as_text(entry.get("emotion")),
+            "text": _as_text(entry.get("text")),
+            "session_id": _as_text(entry.get("session_id")),
+            "source": source,
+            "source_label": VAULT_SOURCE_LABELS.get(source, source),
+            "lossy": source == "platform",
+            "suffix": suffix,
+            "mime": AUDIO_MIME_BY_SUFFIX.get(suffix, "application/octet-stream"),
+            "bytes": size,
+            "bytes_human": audio_compat.format_size(size),
+            "duration_ms": duration_ms,
+            "duration_human": audio_compat.format_duration(duration_ms),
+            "duration_seconds": round(duration_ms / 1000.0, 2),
+            "sha256": _as_text(entry.get("sha256"))[:16],
+            "created_at": _as_int(entry.get("created_at"), 0),
+            "created_text": self._vault_time(entry.get("created_at")),
+            "last_played_at": _as_int(entry.get("last_played_at"), 0),
+            "last_played_text": self._vault_time(entry.get("last_played_at")),
+            "play_count": _as_int(entry.get("play_count"), 0),
+            "pinned": bool(entry.get("pinned")),
+            "tags": [
+                _as_text(tag) for tag in (entry.get("tags") or []) if _as_text(tag)
+            ],
+        }
+
+    def _favorites_payload(
+        self, vault: Any, rows: Optional[List[Dict[str, Any]]] = None
+    ) -> Dict[str, Any]:
+        if rows is None:
+            try:
+                rows = vault.search()
+            except Exception:
+                rows = []
+        try:
+            stats = dict(vault.stats())
+        except Exception:
+            stats = {}
+        source_counts: Dict[str, int] = {}
+        try:
+            for item in vault.entries():
+                key = _as_text(item.get("source")) or "plugin"
+                source_counts[key] = source_counts.get(key, 0) + 1
+        except Exception:
+            source_counts = {}
+        config = self.plugin.config
+        return {
+            "enabled": self._favorites_enabled(),
+            "rows": [self._vault_row(item) for item in rows[:MAX_FAVORITE_ROWS]],
+            "matched": len(rows),
+            "truncated": len(rows) > MAX_FAVORITE_ROWS,
+            "stats": stats,
+            "characters": sorted((stats.get("characters") or {}).keys()),
+            "emotions": sorted((stats.get("emotions") or {}).keys()),
+            "sources": [
+                {
+                    "value": key,
+                    "label": VAULT_SOURCE_LABELS.get(key, key),
+                    "count": source_counts[key],
+                }
+                for key in sorted(source_counts)
+            ],
+            "modes": [
+                {"value": mode, "label": VAULT_MODE_LABELS.get(mode, mode)}
+                for mode in voice_vault.IMPORT_MODES
+            ],
+            "suffixes": sorted(voice_vault.ALLOWED_SUFFIXES),
+            "directory": str(getattr(vault, "root", "")),
+            "max_inline_bytes": MAX_INLINE_AUDIO_BYTES,
+            "max_upload_bytes": MAX_UPLOAD_BUNDLE_BYTES,
+            "max_rows": MAX_FAVORITE_ROWS,
+            "config": {
+                "limit": _as_int(
+                    config.get("voice_favorite_limit"), voice_vault.DEFAULT_LIMIT
+                ),
+                "max_mb": _as_int(config.get("voice_favorite_max_mb"), 32),
+                "upload_mode": _as_text(config.get("voice_file_upload_mode")) or "auto",
+            },
+            "generated_at": time.strftime("%H:%M:%S"),
+        }
+
+    def _favorites_result(self, vault: Any, extra: Dict[str, Any]) -> Any:
+        """写操作的统一出口：回一份最新列表，前端不用再多请求一次。"""
+        payload = self._favorites_payload(vault)
+        payload.update(extra)
+        return self._ok(payload)
+
+    @staticmethod
+    def _resolve_favorite(
+        vault: Any, token: str
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        if not token:
+            return None, "缺少收藏 id"
+        try:
+            entry, reason = vault.resolve(token)
+        except Exception as exc:
+            return None, "解析收藏失败: " + str(exc)
+        if entry is None:
+            return None, reason or "没找到这条收藏"
+        return entry, ""
+
+    @staticmethod
+    def _decode_upload(raw: Any) -> Tuple[bytes, str]:
+        """把前端传来的 base64（允许带 data: 前缀）解成字节，并卡一次体积。"""
+        text = str(raw or "").strip()
+        if not text:
+            return b"", "没有收到文件内容"
+        if text.startswith("data:"):
+            marker = text.find("base64,")
+            if marker < 0:
+                return b"", "只支持 base64 编码的 data URL"
+            text = text[marker + 7 :]
+        text = "".join(text.split())
+        try:
+            body = base64.b64decode(text, validate=True)
+        except Exception as exc:
+            return b"", "文件内容不是合法的 base64: " + str(exc)
+        if not body:
+            return b"", "文件内容是空的"
+        if len(body) > MAX_UPLOAD_BUNDLE_BYTES:
+            return b"", (
+                "文件太大了（"
+                + audio_compat.format_size(len(body))
+                + "），网页上传上限 "
+                + audio_compat.format_size(MAX_UPLOAD_BUNDLE_BYTES)
+                + "。大包可以直接放到服务器的收藏包目录，再用 /收藏导入 处理。"
+            )
+        return body, ""
+
+    def _scratch_path(self, suffix: str) -> Path:
+        """临时落盘目录：导入 / 上传都先写这里，处理完立刻删。"""
+        base = Path(self.plugin._vault_bundle_dir()) / "_scratch"
+        base.mkdir(parents=True, exist_ok=True)
+        token = base64.b16encode(os.urandom(5)).decode("ascii").lower()
+        return base / ("upload-" + token + suffix)
+
+    @staticmethod
+    def _drop_scratch(path: Optional[Path]) -> None:
+        if path is None:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    async def _handle_favorites(self):
+        vault, err = await self._vault_ready()
+        if vault is None:
+            return self._err(err)
+        try:
+            rows = vault.search(
+                keyword=_as_text(self._query("q"), 120),
+                character=_as_text(self._query("character")),
+                emotion=_as_text(self._query("emotion")),
+                session_id=_as_text(self._query("session")),
+                source=_as_text(self._query("source")),
+                pinned_only=_as_bool(self._query("pinned")),
+            )
+        except Exception as exc:
+            logger.error("Genie TTS WebUI 检索收藏失败: " + str(exc))
+            return self._err("检索收藏失败: " + str(exc))
+        return self._ok(self._favorites_payload(vault, rows))
+
+    async def _handle_favorite_audio(self):
+        """网页试听。只回音频，不计播放次数（播放数只统计真正发出去的）。"""
+        vault, err = await self._vault_ready()
+        if vault is None:
+            return self._err(err)
+        entry, err = self._resolve_favorite(vault, _as_text(self._query("id")))
+        if entry is None:
+            return self._err(err)
+        path = vault.audio_path(entry)
+        if not path.is_file():
+            return self._err("音频文件已经不在收藏目录里了，建议删掉这条收藏")
+        row = self._vault_row(entry)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = _as_int(row.get("bytes"), 0)
+        row["bytes"] = size
+        row["bytes_human"] = audio_compat.format_size(size)
+        row["audio_base64"] = ""
+        row["too_large"] = False
+        if size and size <= MAX_INLINE_AUDIO_BYTES:
+            try:
+                row["audio_base64"] = base64.b64encode(path.read_bytes()).decode(
+                    "ascii"
+                )
+            except OSError as exc:
+                return self._err("读取收藏音频失败: " + str(exc))
+        else:
+            row["too_large"] = True
+        return self._ok(row)
+
+    async def _handle_favorite_download(self):
+        vault, err = await self._vault_ready()
+        if vault is None:
+            return self._err(err)
+        entry, err = self._resolve_favorite(vault, _as_text(self._query("id")))
+        if entry is None:
+            return self._err(err)
+        path = vault.audio_path(entry)
+        if not path.is_file():
+            return self._err("音频文件已经不在收藏目录里了，建议删掉这条收藏")
+        suffix = (_as_text(entry.get("suffix")) or ".wav").lower()
+        try:
+            body = path.read_bytes()
+        except OSError as exc:
+            return self._err("读取收藏音频失败: " + str(exc))
+        try:
+            filename = self.plugin._voice_file_name(
+                _as_text(entry.get("alias")),
+                _as_text(entry.get("text")),
+                _as_text(entry.get("character")),
+                _as_text(entry.get("emotion")),
+                suffix,
+            )
+        except Exception:
+            filename = "genie-voice" + suffix
+        return QuartResponse(
+            body,
+            status=200,
+            headers={
+                "Content-Type": AUDIO_MIME_BY_SUFFIX.get(
+                    suffix, "application/octet-stream"
+                ),
+                "Content-Disposition": "attachment; filename=" + filename,
+                "Cache-Control": "no-store",
+            },
+        )
+
+    async def _handle_favorite_export(self):
+        vault, err = await self._vault_ready()
+        if vault is None:
+            return self._err(err)
+        ids: Optional[List[str]] = None
+        tokens = _split_csv(self._query("ids"))
+        if tokens:
+            picked: List[str] = []
+            for token in tokens:
+                entry, reason = self._resolve_favorite(vault, token)
+                if entry is None:
+                    return self._err(reason)
+                entry_id = _as_text(entry.get("id"))
+                if entry_id and entry_id not in picked:
+                    picked.append(entry_id)
+            ids = picked
+        filename = (
+            "genie-voices-" + time.strftime("%Y%m%d-%H%M%S") + ".zip"
+        )
+        try:
+            target = Path(self.plugin._vault_bundle_dir()) / filename
+        except Exception as exc:
+            return self._err("准备收藏包目录失败: " + str(exc))
+        try:
+            result = await vault.export_bundle(target, ids)
+        except VoiceVaultError as exc:
+            return self._err(str(exc))
+        except Exception as exc:
+            logger.error("Genie TTS WebUI 导出收藏失败: " + str(exc))
+            return self._err("导出收藏失败: " + str(exc))
+        try:
+            body = target.read_bytes()
+        except OSError as exc:
+            return self._err("读取收藏包失败: " + str(exc))
+        return QuartResponse(
+            body,
+            status=200,
+            headers={
+                "Content-Type": "application/zip",
+                "Content-Disposition": "attachment; filename=" + filename,
+                "X-Genie-Count": str(_as_int(result.get("count"), 0)),
+                "Cache-Control": "no-store",
+            },
+        )
+
+    async def _handle_favorite_import(self):
+        vault, err = await self._vault_ready()
+        if vault is None:
+            return self._err(err)
+        body = await self._read_body()
+        blob, err = self._decode_upload(body.get("data"))
+        if err:
+            return self._err(err)
+        mode = voice_vault.normalize_import_mode(body.get("mode"))
+        scratch: Optional[Path] = None
+        try:
+            scratch = self._scratch_path(".zip")
+            scratch.write_bytes(blob)
+        except OSError as exc:
+            self._drop_scratch(scratch)
+            return self._err("写入临时收藏包失败: " + str(exc))
+        try:
+            report = await vault.import_bundle(scratch, mode)
+        except VoiceVaultError as exc:
+            return self._err(str(exc))
+        except Exception as exc:
+            logger.error("Genie TTS WebUI 导入收藏失败: " + str(exc))
+            return self._err("导入收藏失败: " + str(exc))
+        finally:
+            self._drop_scratch(scratch)
+        report = dict(report or {})
+        report["mode"] = mode
+        report["mode_label"] = VAULT_MODE_LABELS.get(mode, mode)
+        report["summary_text"] = voice_vault.describe_import(report)
+        return self._favorites_result(vault, {"report": report})
+
+    async def _handle_favorite_upload(self):
+        vault, err = await self._vault_ready()
+        if vault is None:
+            return self._err(err)
+        body = await self._read_body()
+        blob, err = self._decode_upload(body.get("data"))
+        if err:
+            return self._err(err)
+        raw_name = _as_text(body.get("filename"), 160)
+        suffix = os.path.splitext(raw_name)[1].lower()
+        if suffix not in voice_vault.ALLOWED_SUFFIXES:
+            return self._err(
+                "只支持这些音频格式："
+                + "、".join(sorted(voice_vault.ALLOWED_SUFFIXES))
+            )
+        alias = voice_vault.clean_alias(body.get("alias")) or voice_vault.clean_alias(
+            os.path.splitext(os.path.basename(raw_name))[0]
+        )
+        scratch: Optional[Path] = None
+        try:
+            scratch = self._scratch_path(suffix)
+            scratch.write_bytes(blob)
+        except OSError as exc:
+            self._drop_scratch(scratch)
+            return self._err("写入临时音频失败: " + str(exc))
+        try:
+            result = await vault.add(
+                scratch,
+                alias=alias,
+                character=_as_text(body.get("character"), 48),
+                emotion=_as_text(body.get("emotion"), 48),
+                text=_as_text(body.get("text"), voice_vault.MAX_TEXT_CHARS),
+                session_id="webui:studio",
+                source="upload",
+            )
+        except VoiceVaultError as exc:
+            return self._err(str(exc))
+        except Exception as exc:
+            logger.error("Genie TTS WebUI 上传收藏失败: " + str(exc))
+            return self._err("上传收藏失败: " + str(exc))
+        finally:
+            self._drop_scratch(scratch)
+        return self._favorites_result(
+            vault,
+            {
+                "entry": self._vault_row(result.get("entry") or {}),
+                "duplicate": bool(result.get("duplicate")),
+                "dropped": len(result.get("dropped") or []),
+            },
+        )
+
+    async def _handle_favorite_save_synth(self):
+        """把工作台刚合成出来的试听结果一键收进收藏夹。"""
+        vault, err = await self._vault_ready()
+        if vault is None:
+            return self._err(err)
+        body = await self._read_body()
+        raw_path = _as_text(body.get("path"), 500)
+        if not raw_path:
+            return self._err("缺少试听结果路径，先合成一条再收藏")
+        engine = getattr(self.plugin, "tts_engine", None)
+        temp_dir = _as_text(getattr(engine, "temp_audio_dir", ""))
+        if not temp_dir:
+            return self._err("TTS 引擎尚未初始化")
+        target = os.path.abspath(raw_path)
+        root = os.path.abspath(temp_dir)
+        try:
+            inside = os.path.commonpath([target, root]) == root
+        except ValueError:
+            inside = False
+        if not inside:
+            return self._err("只能收藏工作台自己合成出来的音频")
+        if not os.path.isfile(target):
+            return self._err(
+                "这条试听音频已经被清理了（临时音频只保留 30 分钟），重新合成一次再收藏"
+            )
+        try:
+            result = await vault.add(
+                target,
+                alias=voice_vault.clean_alias(body.get("alias")),
+                character=_as_text(body.get("character"), 48),
+                emotion=_as_text(body.get("emotion"), 48),
+                text=_as_text(body.get("text"), voice_vault.MAX_TEXT_CHARS),
+                session_id="webui:studio",
+                source="plugin",
+            )
+        except VoiceVaultError as exc:
+            return self._err(str(exc))
+        except Exception as exc:
+            logger.error("Genie TTS WebUI 收藏试听结果失败: " + str(exc))
+            return self._err("收藏失败: " + str(exc))
+        return self._favorites_result(
+            vault,
+            {
+                "entry": self._vault_row(result.get("entry") or {}),
+                "duplicate": bool(result.get("duplicate")),
+                "dropped": len(result.get("dropped") or []),
+            },
+        )
+
+    async def _handle_favorite_rename(self):
+        vault, err = await self._vault_ready()
+        if vault is None:
+            return self._err(err)
+        body = await self._read_body()
+        entry, err = self._resolve_favorite(vault, _as_text(body.get("id")))
+        if entry is None:
+            return self._err(err)
+        alias = voice_vault.clean_alias(body.get("alias"))
+        if not alias:
+            return self._err("名字不能为空，也不能只由斜杠、冒号之类的非法字符组成")
+        try:
+            updated = await vault.rename(_as_text(entry.get("id")), alias)
+        except VoiceVaultError as exc:
+            return self._err(str(exc))
+        except Exception as exc:
+            return self._err("改名失败: " + str(exc))
+        return self._favorites_result(vault, {"entry": self._vault_row(updated)})
+
+    async def _handle_favorite_update(self):
+        vault, err = await self._vault_ready()
+        if vault is None:
+            return self._err(err)
+        body = await self._read_body()
+        entry, err = self._resolve_favorite(vault, _as_text(body.get("id")))
+        if entry is None:
+            return self._err(err)
+        fields: Dict[str, Any] = {}
+        if "text" in body:
+            fields["text"] = _as_text(body.get("text"), voice_vault.MAX_TEXT_CHARS)
+        if "character" in body:
+            fields["character"] = _as_text(body.get("character"), 48)
+        if "emotion" in body:
+            fields["emotion"] = _as_text(body.get("emotion"), 48)
+        if "pinned" in body:
+            fields["pinned"] = _as_bool(body.get("pinned"))
+        if "tags" in body:
+            fields["tags"] = body.get("tags")
+        if not fields:
+            return self._err("没有需要修改的字段")
+        try:
+            updated = await vault.update(_as_text(entry.get("id")), **fields)
+        except VoiceVaultError as exc:
+            return self._err(str(exc))
+        except Exception as exc:
+            logger.error("Genie TTS WebUI 修改收藏失败: " + str(exc))
+            return self._err("修改收藏失败: " + str(exc))
+        return self._favorites_result(vault, {"entry": self._vault_row(updated)})
+
+    async def _handle_favorite_delete(self):
+        vault, err = await self._vault_ready()
+        if vault is None:
+            return self._err(err)
+        body = await self._read_body()
+        entry, err = self._resolve_favorite(vault, _as_text(body.get("id")))
+        if entry is None:
+            return self._err(err)
+        row = self._vault_row(entry)
+        try:
+            await vault.remove(_as_text(entry.get("id")))
+        except VoiceVaultError as exc:
+            return self._err(str(exc))
+        except Exception as exc:
+            logger.error("Genie TTS WebUI 删除收藏失败: " + str(exc))
+            return self._err("删除收藏失败: " + str(exc))
+        return self._favorites_result(vault, {"deleted": row})
+
+    async def _handle_favorite_clear(self):
+        vault, err = await self._vault_ready()
+        if vault is None:
+            return self._err(err)
+        body = await self._read_body()
+        if not _as_bool(body.get("confirm")):
+            return self._err("清空收藏需要确认（confirm=true）")
+        keep_pinned = _as_bool(body.get("keep_pinned"), True)
+        try:
+            removed = await vault.clear(keep_pinned=keep_pinned)
+        except VoiceVaultError as exc:
+            return self._err(str(exc))
+        except Exception as exc:
+            logger.error("Genie TTS WebUI 清空收藏失败: " + str(exc))
+            return self._err("清空收藏失败: " + str(exc))
+        return self._favorites_result(
+            vault, {"removed": removed, "keep_pinned": keep_pinned}
+        )
 
     # ------------------------------------------------------------ 偏好
 

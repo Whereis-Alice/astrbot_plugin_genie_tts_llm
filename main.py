@@ -5,7 +5,7 @@ import random
 import re
 import time
 from pathlib import Path
-from typing import Dict, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
@@ -14,19 +14,22 @@ import astrbot.api.message_components as Comp
 from astrbot.api.provider import LLMResponse, ProviderRequest
 
 # 从新模块导入功能
+from . import audio_compat
 from . import emotion_pack
+from . import voice_vault
 from .emotion_pack import EmotionPackError
 from .emotion_manager import EmotionManager
 from .tts_engine import DEFAULT_MAX_TEXT_LENGTH, TTSEngine, has_pronounceable
 from .external_apis import translate_text
 from .run_log import RunLog
+from .voice_vault import VoiceVault, VoiceVaultError
 
 
 @register(
     "astrbot_plugin_genie_tts_llm",
     "Whereis-Alice",
     "一个通过 LLM、翻译和 Genie TTS 实现语音合成的插件，支持主动语音工具",
-    "1.9.7",
+    "1.10.0",
     "https://github.com/Whereis-Alice/astrbot_plugin_genie_tts_llm",
 )
 class GenieTtsLlmPlugin(Star):
@@ -36,7 +39,7 @@ class GenieTtsLlmPlugin(Star):
     # 老安装的配置文件里已经写着 true，只改 schema 默认值救不了它们，得迁移一次。
     NOTICE_MIGRATION_KV_KEY = "failure_notice_default_off_v196"
     # 插件版本号：WebUI 总览与感情包元数据都会读它。
-    PLUGIN_VERSION = "1.9.7"
+    PLUGIN_VERSION = "1.10.0"
     # 感情包快照目录名（位于插件数据目录下）。
     PACK_DIR_NAME = "emotion_packs"
     # 能被识别为「导入模式」的 token，真正的语义交给 emotion_pack 归一化。
@@ -58,8 +61,42 @@ class GenieTtsLlmPlugin(Star):
     PACK_DRY_TOKENS = frozenset(
         {"试运行", "预演", "预览", "dry", "dryrun", "dry-run", "-n", "--dry-run"}
     )
-    # 最多记住多少个会话的"最近一条语音"，避免长期运行后字典无限增长。
+    # 最多记住多少个会话的发送历史，避免长期运行后字典无限增长。
     MAX_REMEMBERED_AUDIO = 200
+    # 每个会话往回记多少条已发语音。引用某条语音时要靠这段历史反查原始文件，
+    # 一条根本不够用（用户完全可能引用三句之前那条）。
+    SENT_VOICE_RING = 16
+    # 收藏目录名（位于插件数据目录下）。
+    VAULT_DIR_NAME = "voice_vault"
+    # 引用消息与本地发送记录的时间匹配窗口（秒）。协议端回报的时间是整秒，
+    # 加上网络往返和队列延迟，放宽到 45s 才不会漏；窗口内取最近的一条。
+    QUOTE_MATCH_WINDOW = 45.0
+    # 收藏包的固定文件名前缀。
+    VAULT_BUNDLE_PREFIX = "genie-voices"
+    # /收藏列表 每页条数。QQ 单条消息太长会被折叠，8 条正好一屏。
+    FAVORITE_PAGE_SIZE = 8
+    # /收藏清空 必须显式确认，避免手滑清库。
+    VAULT_CONFIRM_TOKENS = frozenset(
+        {"确认", "确定", "yes", "y", "confirm", "--yes", "-y"}
+    )
+    # /收藏清空 连置顶一起清掉的关键字。
+    VAULT_PINNED_TOKENS = frozenset({"含置顶", "包括置顶", "全部", "all", "--all"})
+    # 能被识别为「收藏导入模式」的 token，语义交给 voice_vault 归一化。
+    VAULT_MODE_TOKENS = frozenset(
+        {
+            "merge",
+            "overwrite",
+            "replace",
+            "skip",
+            "update",
+            "force",
+            "合并",
+            "覆盖",
+            "替换",
+            "清空",
+            "补新",
+        }
+    )
     # 清理 LLM 复读的历史 TTS 失败提示。整条匹配，不留残渣。
     TTS_FAILURE_NOTICE_PATTERN = re.compile(
         r"\n?\(TTS(?:失败[：:][^)]*|合成失败|音频发送失败)\)"
@@ -95,8 +132,11 @@ class GenieTtsLlmPlugin(Star):
         self._keepalive_stop_event = asyncio.Event()
         self._keepalive_task: Optional[asyncio.Task] = None
         self._llm_translation_conflict_logged = False
-        # 会话 -> 最近一次成功合成的临时音频路径，供 /tts-again 复用。
-        self.last_audio_paths: Dict[str, str] = {}
+        # 会话 -> 最近若干条已发语音的元数据环，供 /tts-again、引用收藏、引用转文件复用。
+        # 只存元数据（含临时文件路径），音频本体仍在 tts_engine 的临时目录里，
+        # 30 分钟后会被清理——所以"收藏"必须当场把字节拷进收藏库。
+        self.sent_voices: Dict[str, List[Dict[str, Any]]] = {}
+        self._voice_seq = 0
         self._state_lock = asyncio.Lock()
         self._state_restored = asyncio.Event()
         self._state_restore_task: Optional[asyncio.Task] = None
@@ -110,6 +150,21 @@ class GenieTtsLlmPlugin(Star):
         self.emotion_manager = EmotionManager(emotions_file_path)
         # 感情库整体写盘要串行：WebUI 与聊天指令可能并发提交。
         self._emotion_write_lock = asyncio.Lock()
+
+        # 语音收藏库。索引与音频都落在数据目录下，重启不丢；首次 load() 推迟到真正用到时。
+        self.voice_vault = VoiceVault(
+            plugin_data_dir / self.VAULT_DIR_NAME,
+            limit=self.config.get("voice_favorite_limit", voice_vault.DEFAULT_LIMIT),
+            max_bytes=int(
+                max(float(self.config.get("voice_favorite_max_mb", 32) or 32), 1)
+                * 1024
+                * 1024
+            ),
+        )
+        # 从平台把语音捞回来时用的转码缓存（有损兜底路径专用）。
+        self.audio_converter = audio_compat.AudioConverter(
+            plugin_data_dir / "audio_cache"
+        )
 
         self.http_client = httpx.AsyncClient(timeout=300.0)
         self.tts_engine = TTSEngine(self.config, self.http_client, plugin_data_dir)
@@ -276,18 +331,68 @@ class GenieTtsLlmPlugin(Star):
         except Exception as exc:
             logger.warning(f"保存 TTS 会话状态失败（不影响本次操作）: {exc}")
 
+    # -------------------------------------------------------- 已发语音历史
+
     def _remember_last_audio(
-        self, session_id: str, audio_path: Optional[str]
+        self,
+        session_id: str,
+        audio_path: Optional[str],
+        text: str = "",
+        character: str = "",
+        emotion: str = "",
     ) -> Optional[str]:
-        """记下会话最近一条语音供 /tts-again 复用，并按 LRU 限制字典长度。"""
+        """把刚发出去的语音记进会话历史环，供 /tts-again、引用收藏、引用转文件复用。
+
+        环按「新的在前」排列，长度 SENT_VOICE_RING；会话数仍按 LRU 限制在
+        MAX_REMEMBERED_AUDIO 以内。sent_at 用当前时间：合成完到真正送达之间
+        只差毫秒级，而引用匹配的窗口是几十秒，够用。
+        """
         if not session_id or not audio_path:
             return audio_path
-        # 先 pop 再插入，让 dict 的插入顺序等价于访问顺序。
-        self.last_audio_paths.pop(session_id, None)
-        self.last_audio_paths[session_id] = audio_path
-        while len(self.last_audio_paths) > self.MAX_REMEMBERED_AUDIO:
-            self.last_audio_paths.pop(next(iter(self.last_audio_paths)), None)
+        try:
+            size = os.path.getsize(audio_path)
+        except OSError:
+            size = 0
+        self._voice_seq += 1
+        record: Dict[str, Any] = {
+            "seq": self._voice_seq,
+            "path": audio_path,
+            "text": (text or "").strip()[: voice_vault.MAX_TEXT_CHARS],
+            "character": (character or "").strip()[:48],
+            "emotion": (emotion or "").strip()[:48],
+            "sent_at": time.time(),
+            "size": size,
+        }
+        ring = self.sent_voices.pop(session_id, None) or []
+        ring.insert(0, record)
+        del ring[self.SENT_VOICE_RING :]
+        # 先 pop 再插入，让 dict 的插入顺序等价于访问顺序（LRU）。
+        self.sent_voices[session_id] = ring
+        while len(self.sent_voices) > self.MAX_REMEMBERED_AUDIO:
+            self.sent_voices.pop(next(iter(self.sent_voices)), None)
         return audio_path
+
+    def _session_voice_ring(self, session_id: str) -> List[Dict[str, Any]]:
+        """返回该会话仍有文件存在的已发语音（新的在前），顺手剔除已被清理的。"""
+        ring = self.sent_voices.get(session_id) or []
+        alive = [item for item in ring if os.path.isfile(item.get("path") or "")]
+        if len(alive) != len(ring):
+            if alive:
+                self.sent_voices[session_id] = alive
+            else:
+                self.sent_voices.pop(session_id, None)
+        return alive
+
+    def _latest_sent_voice(self, session_id: str) -> Optional[Dict[str, Any]]:
+        ring = self._session_voice_ring(session_id)
+        return ring[0] if ring else None
+
+    def has_sent_voice(self, session_id: str) -> bool:
+        """WebUI 会话页要用：这个会话还有没有可重发的语音。"""
+        return bool(self._session_voice_ring(session_id))
+
+    def sent_voice_count(self, session_id: str) -> int:
+        return len(self._session_voice_ring(session_id))
 
     def _append_tts_failure_notice(self, resp: LLMResponse, reason: str) -> None:
         """把 TTS 失败提示追加到回复末尾。默认关闭。
@@ -750,6 +855,579 @@ class GenieTtsLlmPlugin(Star):
                 return False, "语音已经发出，但补发文字失败了。"
 
         return True, None
+    # ---------------------------------------------- 引用语音：定位 / 取回 / 外发
+
+    @staticmethod
+    def _find_reply_component(event: AstrMessageEvent) -> Optional[Comp.Reply]:
+        """取出这条消息引用的那条消息；没有引用则返回 None。"""
+        try:
+            components = list(event.get_messages() or [])
+        except Exception:
+            return None
+        for comp in components:
+            if isinstance(comp, Comp.Reply):
+                return comp
+        return None
+
+    @staticmethod
+    def _reply_records(reply: Optional[Comp.Reply]) -> List[Any]:
+        """被引用消息链里的语音段。有些协议端不回填 chain，空不代表没语音。"""
+        if reply is None:
+            return []
+        return [
+            sub
+            for sub in (getattr(reply, "chain", None) or [])
+            if isinstance(sub, Comp.Record)
+        ]
+
+    @staticmethod
+    def _reply_is_self(event: AstrMessageEvent, reply: Optional[Comp.Reply]) -> bool:
+        """被引用的那条是不是 bot 自己发的。"""
+        if reply is None:
+            return False
+        sender = str(getattr(reply, "sender_id", "") or "").strip()
+        self_id = str(getattr(event.message_obj, "self_id", "") or "").strip()
+        return bool(sender) and bool(self_id) and sender == self_id
+
+    async def _fetch_quoted_payload(
+        self, event: AstrMessageEvent, message_id: Any
+    ) -> Dict[str, Any]:
+        """向协议端问被引用消息的原始数据（时间戳 + 消息段）。
+
+        Comp.Reply.time 在 aiocqhttp 适配器里被改写成了「收到事件的时间」，拿它
+        做匹配会把所有引用都算成「刚刚」；get_msg 回的 time 才是原消息时间戳。
+        get_msg 是标准 OneBot v11 action，NapCat / LLOneBot(LLBot) / SnowLuma 都有。
+        非 OneBot 平台没有 bot 对象，直接返回空字典走近似匹配。
+        """
+        bot = getattr(event, "bot", None)
+        raw_id = str(message_id or "").strip()
+        if bot is None or not raw_id:
+            return {}
+        try:
+            target_id: Any = int(raw_id)
+        except ValueError:
+            target_id = raw_id
+        try:
+            raw = await bot.get_msg(message_id=target_id)
+        except Exception as exc:
+            logger.debug(f"Genie TTS: get_msg 取引用消息失败，改用近似匹配: {exc}")
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        # aiocqhttp 已经拆掉一层 data，别的桥接可能还包着。
+        inner = raw.get("data")
+        if isinstance(inner, dict) and ("message" in inner or "time" in inner):
+            return inner
+        return raw
+
+    @staticmethod
+    def _payload_time(payload: Dict[str, Any]) -> Optional[float]:
+        """从 get_msg 返回体里读发送时间（秒）。读不到返回 None。"""
+        try:
+            stamp = float((payload or {}).get("time"))
+        except (TypeError, ValueError):
+            return None
+        if stamp <= 0:
+            return None
+        # 少数实现回的是毫秒；秒级时间戳在本世纪内不可能超过 1e11。
+        if stamp > 1e11:
+            stamp /= 1000.0
+        return stamp
+
+    @staticmethod
+    def _payload_record_segments(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """从 get_msg 返回体里挑出语音段。message 既可能是数组也可能是 CQ 码串。"""
+        message = (payload or {}).get("message")
+        found: List[Dict[str, Any]] = []
+        if isinstance(message, list):
+            for seg in message:
+                if not isinstance(seg, dict):
+                    continue
+                if str(seg.get("type") or "").lower() != "record":
+                    continue
+                data = seg.get("data")
+                found.append(data if isinstance(data, dict) else {})
+            return found
+        if isinstance(message, str) and "[CQ:record" in message:
+            for chunk in re.findall(r"\[CQ:record,([^\]]*)\]", message):
+                data: Dict[str, Any] = {}
+                for pair in chunk.split(","):
+                    key, sep, value = pair.partition("=")
+                    if sep:
+                        data[key.strip()] = value.strip()
+                found.append(data)
+        return found
+
+    def _match_sent_voice(
+        self, session_id: str, quoted_at: Optional[float]
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """在本会话已发语音环里找出被引用的那条。
+
+        有真实时间戳就按时间就近匹配（窗口 QUOTE_MATCH_WINDOW）；拿不到时间
+        （非 OneBot 平台 / get_msg 不可用）就退化成「只有一条就用它，否则用最近
+        一条」，跟 /tts-again 的语义保持一致。
+        """
+        ring = self._session_voice_ring(session_id)
+        if not ring:
+            return None, "本会话没有还在的语音记录"
+        if quoted_at is None:
+            if len(ring) == 1:
+                return ring[0], "会话内唯一记录"
+            return ring[0], "拿不到引用时间，取最近一条"
+        best: Optional[Dict[str, Any]] = None
+        best_delta = 0.0
+        for item in ring:
+            delta = abs(float(item.get("sent_at") or 0.0) - quoted_at)
+            if best is None or delta < best_delta:
+                best, best_delta = item, delta
+        if best is None or best_delta > self.QUOTE_MATCH_WINDOW:
+            return None, "本地记录与引用时间对不上"
+        return best, f"时间匹配 ±{best_delta:.1f}s"
+
+    @staticmethod
+    def _file_uri_to_path(uri: str) -> str:
+        """把 file:// URI 还原成本地路径，Windows 盘符与 UNC 都照顾到。
+
+        SDK 里的 convert_to_file_path 是硬切 8 个字符，遇到规范的
+        file:///home/x 会丢掉前导斜杠，所以这里自己解一遍。
+        """
+        from urllib.parse import unquote, urlparse
+
+        try:
+            parsed = urlparse(uri)
+        except Exception:
+            return ""
+        local = unquote(parsed.path or "")
+        host = (parsed.netloc or "").strip()
+        if host and host.lower() != "localhost":
+            return "//" + host + local
+        if re.match(r"^/[A-Za-z]:", local):
+            local = local[1:]
+        return local
+
+    async def _localize_voice_hint(self, hint: Any) -> str:
+        """把协议端给的 路径 / file:// / http / base64:// 变成本地文件路径。
+
+        失败返回空串——这条链本来就是兜底，任何一步不通都还有下一个候选。
+        """
+        text = str(hint or "").strip()
+        if not text:
+            return ""
+        if os.path.isfile(text):
+            return os.path.abspath(text)
+        lowered = text.lower()
+        if lowered.startswith("file://"):
+            local = self._file_uri_to_path(text)
+            return os.path.abspath(local) if local and os.path.isfile(local) else ""
+        if not lowered.startswith(("http://", "https://", "base64://")):
+            return ""
+        try:
+            resolved = await Comp.Record(file=text).convert_to_file_path()
+        except Exception as exc:
+            logger.debug(f"Genie TTS: 语音候选取本地失败: {exc}")
+            return ""
+        return resolved if resolved and os.path.isfile(resolved) else ""
+
+    async def _fetch_record_via_action(
+        self,
+        event: AstrMessageEvent,
+        reply: Optional[Comp.Reply],
+        payload: Dict[str, Any],
+    ) -> str:
+        """用 OneBot 的 get_record 让协议端把语音转成 WAV 落到本地。
+
+        NapCat / LLOneBot(LLBot) / SnowLuma 都实现了这个 action。file 参数要的是
+        协议端自己的语音标识（file / file_id / 文件名），所以候选值挨个试。
+        """
+        bot = getattr(event, "bot", None)
+        if bot is None:
+            return ""
+        hints: List[str] = []
+
+        def push(value: Any) -> None:
+            item = str(value or "").strip()
+            if item and item not in hints:
+                hints.append(item)
+
+        for rec in self._reply_records(reply):
+            push(getattr(rec, "file", ""))
+            push(getattr(rec, "path", ""))
+        for data in self._payload_record_segments(payload):
+            for key in ("file_id", "file", "file_unique", "path"):
+                push(data.get(key))
+
+        for hint in hints[:4]:
+            try:
+                raw = await bot.call_action("get_record", file=hint, out_format="wav")
+            except Exception as exc:
+                logger.debug(f"Genie TTS: get_record 失败（候选已跳过）: {exc}")
+                continue
+            body = raw if isinstance(raw, dict) else {}
+            inner = body.get("data")
+            if isinstance(inner, dict):
+                body = inner
+            for key in ("path", "file", "url"):
+                local = await self._localize_voice_hint(body.get(key))
+                if local:
+                    return local
+        return ""
+
+    async def _extract_platform_voice(
+        self,
+        event: AstrMessageEvent,
+        reply: Optional[Comp.Reply],
+        payload: Dict[str, Any],
+    ) -> Tuple[str, str]:
+        """兜底：把平台侧存的那份语音捞下来转成 WAV。返回 (路径, 说明)。
+
+        协议端存的通常是它自己转码过的 silk/amr，比插件本地那份原始 WAV 有损，
+        所以只在本地记录对不上时才走这条路，并且必须告诉用户音质降级了。
+        """
+        raw_path = ""
+        channel = ""
+
+        for rec in self._reply_records(reply):
+            direct = str(getattr(rec, "path", "") or "").strip()
+            if direct and os.path.isfile(direct):
+                raw_path, channel = os.path.abspath(direct), "引用消息段"
+                break
+            resolved = await self._localize_voice_hint(getattr(rec, "file", ""))
+            if not resolved:
+                try:
+                    candidate = await rec.convert_to_file_path()
+                except Exception as exc:
+                    logger.debug(f"Genie TTS: 语音段转本地文件失败: {exc}")
+                    candidate = ""
+                if candidate and os.path.isfile(candidate):
+                    resolved = candidate
+            if resolved:
+                raw_path, channel = resolved, "引用消息段"
+                break
+
+        if not raw_path:
+            for data in self._payload_record_segments(payload):
+                for key in ("path", "file", "url"):
+                    resolved = await self._localize_voice_hint(data.get(key))
+                    if resolved:
+                        raw_path, channel = resolved, "get_msg"
+                        break
+                if raw_path:
+                    break
+
+        if not raw_path:
+            fetched = await self._fetch_record_via_action(event, reply, payload)
+            if fetched:
+                raw_path, channel = fetched, "get_record"
+
+        if not raw_path:
+            return "", "协议端没给出可读的语音文件"
+
+        try:
+            wav_path, convert_note = await self.audio_converter.to_wav(raw_path)
+        except Exception as exc:
+            logger.warning(f"Genie TTS: 引用语音转码失败: {exc}")
+            return "", f"转码失败（{type(exc).__name__}）"
+        return wav_path, channel + " → " + convert_note
+
+    @staticmethod
+    def _describe_local_voice(
+        record: Dict[str, Any], note: str = ""
+    ) -> Dict[str, Any]:
+        """把本地发送记录包成统一的解析结果。"""
+        return {
+            "ok": True,
+            "error": "",
+            "path": str(record.get("path") or ""),
+            "text": str(record.get("text") or ""),
+            "character": str(record.get("character") or ""),
+            "emotion": str(record.get("emotion") or ""),
+            "lossy": False,
+            "note": note,
+            "source": "plugin",
+        }
+
+    async def _resolve_quoted_voice(
+        self, event: AstrMessageEvent, allow_fallback: bool = True
+    ) -> Dict[str, Any]:
+        """把「用户引用的那条语音」解析成一个本地可读的音频文件。
+
+        优先用插件自己的发送记录（原始 WAV，无损）；对不上才退回平台侧的有损
+        副本。返回值里的 lossy 决定要不要在回复里提醒用户音质有损。
+        """
+        session_id = event.unified_msg_origin
+        reply = self._find_reply_component(event)
+
+        if reply is None:
+            if not allow_fallback:
+                return {"ok": False, "error": "请先引用我发的那条语音，再发这条指令。"}
+            latest = self._latest_sent_voice(session_id)
+            if latest is None:
+                return {
+                    "ok": False,
+                    "error": (
+                        "没找到语音。用法：引用我发的那条语音再发这条指令；"
+                        "不引用时会自动用本会话最近一条语音。"
+                    ),
+                }
+            return self._describe_local_voice(latest, "未引用，取本会话最近一条")
+
+        payload = await self._fetch_quoted_payload(event, getattr(reply, "id", None))
+        quoted_at = self._payload_time(payload)
+        matched, note = self._match_sent_voice(session_id, quoted_at)
+        if matched is not None:
+            return self._describe_local_voice(matched, note)
+
+        has_voice = bool(self._reply_records(reply)) or bool(
+            self._payload_record_segments(payload)
+        )
+        quoted_text = str(getattr(reply, "message_str", "") or "").strip()
+        if not has_voice and quoted_text:
+            return {
+                "ok": False,
+                "error": "引用的那条消息里只有文字，没有语音。请引用一条语音消息。",
+            }
+
+        path, channel = await self._extract_platform_voice(event, reply, payload)
+        if not path:
+            return {
+                "ok": False,
+                "error": (
+                    "没能取到这条语音（" + (channel or note) + "）。\n"
+                    "常见原因：AstrBot 重启过、临时音频超过 30 分钟被清理、"
+                    "或协议端不支持 get_record。\n"
+                    "不引用直接发指令可以取本会话最近一条语音。"
+                ),
+            }
+        return {
+            "ok": True,
+            "error": "",
+            "path": path,
+            "text": "",
+            "character": "",
+            "emotion": "",
+            "lossy": True,
+            "note": channel,
+            "source": "platform",
+        }
+
+    def _voice_file_name(
+        self,
+        alias: str = "",
+        text: str = "",
+        character: str = "",
+        emotion: str = "",
+        suffix: str = ".wav",
+    ) -> str:
+        """给外发的语音文件起个能看懂的名字。"""
+        seed = alias or (text or "")[:24] or "-".join(
+            x for x in (character, emotion) if x
+        )
+        stem = voice_vault.safe_filename(seed, fallback=self.VAULT_BUNDLE_PREFIX)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        tail = suffix if suffix.startswith(".") else "." + (suffix or "wav")
+        return stem + "-" + stamp + tail
+
+    async def _send_voice_as_file(
+        self, event: AstrMessageEvent, source_path: str, filename: str
+    ) -> Tuple[bool, str]:
+        """把音频当「文件」发出去，返回 (是否成功, 通道说明或失败原因)。
+
+        先走 Comp.File：配了 callback_api_base 时 AstrBot 会把它注册成 HTTP 直链，
+        协议端和 AstrBot 不在同一台机器上也能下到。失败再退回 OneBot 的
+        upload_group_file / upload_private_file（NapCat / LLOneBot / SnowLuma 都有）。
+        """
+        abs_path = os.path.abspath(source_path)
+        if not os.path.isfile(abs_path):
+            return False, "音频文件已经不在了"
+        mode = (
+            str(self.config.get("voice_file_upload_mode", "auto") or "auto")
+            .strip()
+            .lower()
+        )
+        if mode not in ("auto", "component", "onebot_action"):
+            mode = "auto"
+
+        problems: List[str] = []
+        if mode in ("auto", "component"):
+            try:
+                await event.send(
+                    MessageChain(chain=[Comp.File(name=filename, file=abs_path)])
+                )
+                return True, "文件消息段"
+            except Exception as exc:
+                problems.append(f"文件消息段: {exc}")
+                logger.warning(f"Genie TTS: 语音转文件走消息段失败: {exc}")
+
+        if mode in ("auto", "onebot_action"):
+            ok, err = await self._upload_file_via_onebot(event, abs_path, filename)
+            if ok:
+                return True, "OneBot 上传接口"
+            problems.append(f"OneBot 上传接口: {err}")
+
+        return False, "; ".join(problems) or "当前平台不支持发送文件"
+
+    async def _upload_file_via_onebot(
+        self, event: AstrMessageEvent, abs_path: str, filename: str
+    ) -> Tuple[bool, str]:
+        """走 OneBot v11 的群/私聊文件上传 action。"""
+        bot = getattr(event, "bot", None)
+        if bot is None:
+            return False, "当前平台没有 OneBot 接口"
+        group_id = str(event.get_group_id() or "").strip()
+        sender_id = str(event.get_sender_id() or "").strip()
+        try:
+            if group_id:
+                await bot.call_action(
+                    "upload_group_file",
+                    group_id=int(group_id),
+                    file=abs_path,
+                    name=filename,
+                )
+            else:
+                await bot.call_action(
+                    "upload_private_file",
+                    user_id=int(sender_id),
+                    file=abs_path,
+                    name=filename,
+                )
+        except Exception as exc:
+            return False, str(exc)[:180]
+        return True, ""
+
+    # ------------------------------------------------------------ 收藏库辅助
+
+    def _sync_vault_config(self) -> None:
+        """把配置里的收藏容量同步给收藏库。WebUI 改完配置不用重启即生效。"""
+        try:
+            limit = int(
+                self.config.get("voice_favorite_limit", voice_vault.DEFAULT_LIMIT)
+                or voice_vault.DEFAULT_LIMIT
+            )
+        except (TypeError, ValueError):
+            limit = voice_vault.DEFAULT_LIMIT
+        try:
+            max_mb = float(self.config.get("voice_favorite_max_mb", 32) or 32)
+        except (TypeError, ValueError):
+            max_mb = 32.0
+        self.voice_vault.configure(
+            limit=limit, max_bytes=int(max(max_mb, 1.0) * 1024 * 1024)
+        )
+
+    def _favorites_enabled(self) -> bool:
+        return bool(self.config.get("enable_voice_favorites", True))
+
+    @staticmethod
+    def _favorites_disabled_hint() -> str:
+        return (
+            "语音收藏功能当前是关闭的。\n"
+            "去 AstrBot WebUI 的插件配置里打开 enable_voice_favorites，"
+            "或在「语音合成工作台」的设置页勾上「启用语音收藏」。"
+        )
+
+    def _vault_bundle_dir(self) -> Path:
+        """收藏包（.zip）的服务端目录，惰性创建。"""
+        base = (
+            Path(getattr(self, "plugin_data_dir", "."))
+            / self.VAULT_DIR_NAME
+            / "bundles"
+        )
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+
+    @staticmethod
+    def _format_favorite_row(entry: Dict[str, Any]) -> str:
+        """把一条收藏渲染成列表里的一行。"""
+        index = int(entry.get("index") or 0)
+        head = f"{index}. " if index else "• "
+        pin = "📌" if entry.get("pinned") else ""
+        name = str(entry.get("alias") or "").strip() or (
+            "#" + str(entry.get("id") or "")[:6]
+        )
+        meta = [audio_compat.format_duration(int(entry.get("duration_ms") or 0))]
+        tone = "/".join(
+            str(x) for x in (entry.get("character"), entry.get("emotion")) if x
+        )
+        if tone:
+            meta.append(tone)
+        if entry.get("source") == "platform":
+            meta.append("有损")
+        plays = int(entry.get("play_count") or 0)
+        if plays:
+            meta.append(f"播{plays}")
+        body = re.sub(r"\s+", " ", str(entry.get("text") or "")).strip()
+        if len(body) > 28:
+            body = body[:28] + "…"
+        line = head + pin + name + " [" + " · ".join(meta) + "]"
+        return line + " " + body if body else line
+
+    def _favorite_index(self, entry_id: str) -> int:
+        """查一条收藏在全库里的序号（1 起）。查不到返回 0。"""
+        target = str(entry_id or "")
+        if not target:
+            return 0
+        for position, row in enumerate(self.voice_vault.entries(), start=1):
+            if row.get("id") == target:
+                return position
+        return 0
+
+    async def _pick_favorite(
+        self, token: str
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """按用户给的「序号 / 名字 / id」取一条收藏，返回 (带 index 的副本, 错误)。"""
+        self._sync_vault_config()
+        try:
+            await self.voice_vault.load()
+        except Exception as exc:
+            logger.error(f"Genie TTS: 读取收藏库失败: {exc}")
+            return None, f"读取收藏库失败: {exc}"
+        entry, err = self.voice_vault.resolve(token)
+        if entry is None:
+            return None, err or "没找到这条收藏。"
+        picked = dict(entry)
+        picked["index"] = self._favorite_index(str(entry.get("id") or ""))
+        return picked, ""
+
+    def _favorite_stats_line(self) -> str:
+        stats = self.voice_vault.stats()
+        line = (
+            f"共 {stats.get('count')}/{stats.get('limit')} 条 · "
+            f"{stats.get('total_bytes_human')} · {stats.get('total_duration_human')}"
+        )
+        if stats.get("pinned"):
+            line += f" · 置顶 {stats.get('pinned')}"
+        return line
+
+    async def _bundle_path_from_event(
+        self, event: AstrMessageEvent
+    ) -> Tuple[str, str]:
+        """从附件或引用消息里找出收藏包文件，返回 (本地路径, 来源说明)。"""
+        try:
+            components = list(event.get_messages() or [])
+        except Exception:
+            components = []
+        candidates: List[Any] = []
+        for comp in components:
+            if isinstance(comp, Comp.File):
+                candidates.append(comp)
+        for comp in components:
+            if not isinstance(comp, Comp.Reply):
+                continue
+            for sub in getattr(comp, "chain", None) or []:
+                if isinstance(sub, Comp.File):
+                    candidates.append(sub)
+        for comp in candidates:
+            try:
+                local_path = await comp.get_file()
+            except Exception as exc:
+                logger.warning(f"Genie TTS: 获取收藏包附件失败: {exc}")
+                continue
+            if not local_path or not os.path.isfile(local_path):
+                continue
+            name = str(getattr(comp, "name", "") or "") or os.path.basename(
+                str(local_path)
+            )
+            return os.path.abspath(str(local_path)), f"附件 {name}"
+        return "", ""
 
     def _get_keepalive_urls(self) -> list[str]:
         """获取所有需要保活的目标地址。包括配置的TTS服务器和额外的保活地址。"""
@@ -1377,6 +2055,20 @@ class GenieTtsLlmPlugin(Star):
             yield event.plain_result("❌ 本群组已被禁用语音合成功能。")
             return
 
+        # 指令过滤器不是 greedy 的：只有 GreedyStr 才会吃掉剩余全部 token，所以
+        # "/合成 角色 感情 今天 天气 不错" 只会把「今天」塞进形参，后面全被丢掉。
+        # 自己从原文里把第三段起的整句捞回来，带空格的文本才不会被截断。
+        raw_tail = self._strip_command_prefix(event.get_message_str(), ("合成",))
+        tail_parts = re.split(r"\s+", raw_tail.strip(), maxsplit=2)
+        if (
+            len(tail_parts) >= 3
+            and tail_parts[0] == character_name
+            and tail_parts[1] == emotion_name
+        ):
+            recovered = tail_parts[2].strip()
+            if recovered:
+                text_to_synthesize = recovered
+
         trace = self.run_log.begin_synth(
             "command",
             session=event.unified_msg_origin,
@@ -1413,7 +2105,13 @@ class GenieTtsLlmPlugin(Star):
 
         if audio_path:
             trace.ok(audio_path=audio_path, output_mode="仅语音")
-            self._remember_last_audio(event.unified_msg_origin, audio_path)
+            self._remember_last_audio(
+                event.unified_msg_origin,
+                audio_path,
+                text=text_to_synthesize,
+                character=character_name,
+                emotion=emotion_name,
+            )
             yield event.chain_result([Comp.Record(file=audio_path)])
         else:
             trace.fail("TTS合成失败")
@@ -1635,6 +2333,21 @@ class GenieTtsLlmPlugin(Star):
             )
         lines.append(f"• 排队中的合成请求: {self.tts_engine.queue_size()}")
 
+        ring_count = self.sent_voice_count(session_id)
+        lines.append(
+            f"• 可重发的历史语音: {ring_count} 条"
+            + ("（引用其中任意一条即可 /语音收藏）" if ring_count else "（先合成一句）")
+        )
+        if self._favorites_enabled():
+            try:
+                self._sync_vault_config()
+                await self.voice_vault.load()
+                lines.append("• 语音收藏: " + self._favorite_stats_line())
+            except Exception as exc:
+                lines.append(f"• 语音收藏: ⚠ 读取失败（{exc}）")
+        else:
+            lines.append("• 语音收藏: ⏹️ 已关闭（enable_voice_favorites）")
+
         yield event.plain_result("\n".join(lines) + "\n\n🛰️ 正在探测 TTS 服务器…")
 
         probes = await self.tts_engine.probe_servers()
@@ -1681,22 +2394,614 @@ class GenieTtsLlmPlugin(Star):
             yield event.plain_result("❌ 本群组已被禁用语音合成功能。")
             return
 
-        audio_path = self.last_audio_paths.get(session_id)
-        if not audio_path:
+        latest = self._latest_sent_voice(session_id)
+        if latest is None:
             yield event.plain_result(
-                "本会话还没有生成过语音，先用 /合成 或开启 /tts-llm 让我说一句吧。"
+                "本会话没有可重发的语音。\n"
+                "• 还没合成过：先用 /合成 或开启 /tts-llm 让我说一句；\n"
+                "• 合成过但隔了一段时间：临时音频默认只保留 30 分钟，请重新合成；\n"
+                "• 想长期留住某条语音：引用它发 /语音收藏。"
             )
             return
 
-        if not os.path.exists(audio_path):
-            self.last_audio_paths.pop(session_id, None)
-            yield event.plain_result(
-                "最近一条语音的临时文件已被清理（临时音频默认只保留一段时间），请重新合成。"
-            )
-            return
-
-        yield event.chain_result([Comp.Record(file=audio_path)])
+        yield event.chain_result([Comp.Record(file=str(latest.get("path") or ""))])
         event.stop_event()
+
+    @filter.command("语音收藏", alias={"tts-fav", "收藏语音"})
+    async def favorite_voice_command(self, event: AstrMessageEvent, alias: str = ""):
+        """引用我发过的那条语音再发这条指令，把它原封不动收进收藏夹"""
+        if self._is_group_blacklisted(event.message_obj.group_id):
+            yield event.plain_result("❌ 本群组已被禁用语音合成功能。")
+            return
+        if not self._favorites_enabled():
+            yield event.plain_result(self._favorites_disabled_hint())
+            return
+
+        raw_tail = self._strip_command_prefix(
+            event.get_message_str(), ("语音收藏", "收藏语音", "tts-fav")
+        )
+        name = voice_vault.clean_alias(raw_tail or alias or "")
+
+        resolved = await self._resolve_quoted_voice(event)
+        if not resolved.get("ok"):
+            yield event.plain_result("❌ " + str(resolved.get("error") or "没找到语音。"))
+            return
+
+        self._sync_vault_config()
+        try:
+            result = await self.voice_vault.add(
+                resolved.get("path") or "",
+                alias=name,
+                character=str(resolved.get("character") or ""),
+                emotion=str(resolved.get("emotion") or ""),
+                text=str(resolved.get("text") or ""),
+                session_id=event.unified_msg_origin,
+                source=str(resolved.get("source") or "plugin"),
+            )
+        except VoiceVaultError as exc:
+            yield event.plain_result(f"❌ {exc}")
+            return
+        except Exception as exc:
+            logger.error(f"Genie TTS: 收藏语音失败: {exc}")
+            yield event.plain_result(f"❌ 收藏失败: {exc}")
+            return
+
+        entry = dict(result.get("entry") or {})
+        entry["index"] = self._favorite_index(str(entry.get("id") or ""))
+        lines = [
+            "⭐ 这条早就收藏过了，已把新信息补上" if result.get("duplicate") else "⭐ 已收藏",
+            self._format_favorite_row(entry),
+            self._favorite_stats_line(),
+        ]
+        note = str(resolved.get("note") or "").strip()
+        if note:
+            lines.append("来源: " + note)
+        if resolved.get("lossy"):
+            lines.append(
+                "⚠ 这份是从协议端捞回来的副本，音质已经被压过一次。"
+                "想要无损，请在我发出语音后 30 分钟内引用收藏。"
+            )
+        dropped = result.get("dropped") or []
+        if dropped:
+            lines.append(
+                f"⚠ 超出容量，淘汰了最旧的 {len(dropped)} 条（置顶的不会被淘汰）。"
+            )
+        handle = str(entry.get("alias") or "") or str(entry.get("index") or "")
+        lines.append(f"听: /发收藏 {handle} · 存文件: /收藏文件 {handle}")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("收藏列表", alias={"tts-favs", "语音收藏列表"})
+    async def list_favorites_command(self, event: AstrMessageEvent, token: str = ""):
+        """列出收藏夹。参数是纯数字当页码，否则当关键词筛选"""
+        if not self._favorites_enabled():
+            yield event.plain_result(self._favorites_disabled_hint())
+            return
+
+        raw = self._strip_command_prefix(
+            event.get_message_str(), ("收藏列表", "语音收藏列表", "tts-favs")
+        ) or (token or "")
+        raw = re.sub(r"\s+", " ", raw).strip()
+
+        page = 1
+        keyword = ""
+        if raw.isdigit():
+            page = max(int(raw), 1)
+        elif raw:
+            head, _, tail = raw.rpartition(" ")
+            if head and tail.isdigit():
+                keyword = head.strip()
+                page = max(int(tail), 1)
+            else:
+                keyword = raw
+
+        self._sync_vault_config()
+        try:
+            await self.voice_vault.load()
+        except Exception as exc:
+            logger.error(f"Genie TTS: 读取收藏库失败: {exc}")
+            yield event.plain_result(f"❌ 读取收藏库失败: {exc}")
+            return
+
+        rows = self.voice_vault.search(keyword=keyword)
+        if not rows:
+            if keyword:
+                yield event.plain_result(
+                    f"没有匹配「{keyword}」的收藏（全库共 {self.voice_vault.count()} 条）。"
+                )
+            else:
+                yield event.plain_result(
+                    "收藏夹还是空的。\n"
+                    "用法：引用我发的任意一条语音，发 /语音收藏 [名字]。\n"
+                    "也可以在 WebUI「语音合成工作台」的「语音收藏」页里管理。"
+                )
+            return
+
+        size = self.FAVORITE_PAGE_SIZE
+        pages = max((len(rows) + size - 1) // size, 1)
+        page = min(page, pages)
+        chunk = rows[(page - 1) * size : page * size]
+
+        title = "⭐ 语音收藏"
+        if keyword:
+            title += f"（关键词「{keyword}」命中 {len(rows)} 条）"
+        lines = [f"{title} 第 {page}/{pages} 页"]
+        lines.extend(self._format_favorite_row(row) for row in chunk)
+        lines.append(self._favorite_stats_line())
+        if pages > 1:
+            nav = f"翻页: /收藏列表 {min(page + 1, pages)}"
+            if keyword:
+                nav = f"翻页: /收藏列表 {keyword} {min(page + 1, pages)}"
+            lines.append(nav)
+        lines.append("听: /发收藏 序号 · 存文件: /收藏文件 序号 · 全部指令: /语音帮助")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("发收藏", alias={"tts-fav-send", "播放收藏"})
+    async def send_favorite_command(self, event: AstrMessageEvent, token: str = ""):
+        """把收藏夹里的某条语音直接发出来听"""
+        if self._is_group_blacklisted(event.message_obj.group_id):
+            yield event.plain_result("❌ 本群组已被禁用语音合成功能。")
+            return
+        if not self._favorites_enabled():
+            yield event.plain_result(self._favorites_disabled_hint())
+            return
+
+        raw = (
+            self._strip_command_prefix(
+                event.get_message_str(), ("发收藏", "播放收藏", "tts-fav-send")
+            )
+            or token
+            or ""
+        ).strip()
+        if not raw:
+            yield event.plain_result(
+                "用法: /发收藏 序号或名字\n先用 /收藏列表 看序号。"
+            )
+            return
+
+        entry, err = await self._pick_favorite(raw)
+        if entry is None:
+            yield event.plain_result(f"❌ {err}")
+            return
+        path = self.voice_vault.audio_path(entry)
+        if not path.is_file():
+            yield event.plain_result(
+                "❌ 这条收藏的音频文件不见了（可能被手动删过）。\n"
+                f"用 /删收藏 {entry.get('index') or entry.get('id')} 清掉这条记录。"
+            )
+            return
+
+        await self.voice_vault.touch(str(entry.get("id") or ""))
+        # 记进已发环，这样刚发出来的收藏也能被引用去转文件 / 再收藏。
+        self._remember_last_audio(
+            event.unified_msg_origin,
+            str(path),
+            text=str(entry.get("text") or ""),
+            character=str(entry.get("character") or ""),
+            emotion=str(entry.get("emotion") or ""),
+        )
+        yield event.chain_result([Comp.Record(file=str(path))])
+        event.stop_event()
+
+    @filter.command("收藏文件", alias={"tts-fav-file", "收藏转文件"})
+    async def favorite_file_command(self, event: AstrMessageEvent, token: str = ""):
+        """把收藏夹里的某条语音当文件发出来，方便存到手机或电脑"""
+        if not self._favorites_enabled():
+            yield event.plain_result(self._favorites_disabled_hint())
+            return
+
+        raw = (
+            self._strip_command_prefix(
+                event.get_message_str(), ("收藏文件", "收藏转文件", "tts-fav-file")
+            )
+            or token
+            or ""
+        ).strip()
+        if not raw:
+            yield event.plain_result("用法: /收藏文件 序号或名字（/收藏列表 看序号）")
+            return
+
+        entry, err = await self._pick_favorite(raw)
+        if entry is None:
+            yield event.plain_result(f"❌ {err}")
+            return
+        path = self.voice_vault.audio_path(entry)
+        if not path.is_file():
+            yield event.plain_result("❌ 这条收藏的音频文件不见了，用 /删收藏 清掉记录。")
+            return
+
+        filename = self._voice_file_name(
+            alias=str(entry.get("alias") or ""),
+            text=str(entry.get("text") or ""),
+            character=str(entry.get("character") or ""),
+            emotion=str(entry.get("emotion") or ""),
+            suffix=str(entry.get("suffix") or ".wav"),
+        )
+        ok, channel = await self._send_voice_as_file(event, str(path), filename)
+        if not ok:
+            yield event.plain_result(
+                f"❌ 文件没发出去（{channel}）。\n"
+                "可以去 WebUI「语音合成工作台」的「语音收藏」页直接下载。"
+            )
+            return
+        yield event.plain_result(
+            f"📎 已发送 {filename}（{channel}）\n"
+            f"原始格式 {str(entry.get('suffix') or '.wav')}，字节级原样，未再压缩。"
+        )
+
+    @filter.command("语音转文件", alias={"tts-to-file", "语音存文件"})
+    async def voice_to_file_command(self, event: AstrMessageEvent):
+        """引用一条语音（不引用则取本会话最近一条），把它当文件发回来"""
+        resolved = await self._resolve_quoted_voice(event)
+        if not resolved.get("ok"):
+            yield event.plain_result("❌ " + str(resolved.get("error") or "没找到语音。"))
+            return
+
+        path = str(resolved.get("path") or "")
+        suffix = os.path.splitext(path)[1] or ".wav"
+        filename = self._voice_file_name(
+            text=str(resolved.get("text") or ""),
+            character=str(resolved.get("character") or ""),
+            emotion=str(resolved.get("emotion") or ""),
+            suffix=suffix,
+        )
+        ok, channel = await self._send_voice_as_file(event, path, filename)
+        if not ok:
+            yield event.plain_result(
+                f"❌ 文件没发出去（{channel}）。\n"
+                "常见原因：协议端不允许上传文件，或 AstrBot 与协议端不在同一台机器"
+                "且没配 callback_api_base。"
+            )
+            return
+
+        lines = [f"📎 已发送 {filename}（{channel}）"]
+        if resolved.get("lossy"):
+            lines.append("⚠ 这份是协议端的转码副本，音质有损；30 分钟内引用可拿到原始 WAV。")
+        else:
+            lines.append("这是我合成时的原始 WAV，没有二次压缩。")
+        lines.append("想长期留住它: 引用同一条语音发 /语音收藏 [名字]")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("删收藏", alias={"tts-fav-del", "删除收藏"})
+    async def delete_favorite_command(self, event: AstrMessageEvent, token: str = ""):
+        """从收藏夹里删掉一条"""
+        if not self._favorites_enabled():
+            yield event.plain_result(self._favorites_disabled_hint())
+            return
+
+        raw = (
+            self._strip_command_prefix(
+                event.get_message_str(), ("删收藏", "删除收藏", "tts-fav-del")
+            )
+            or token
+            or ""
+        ).strip()
+        if not raw:
+            yield event.plain_result("用法: /删收藏 序号或名字（/收藏列表 看序号）")
+            return
+
+        entry, err = await self._pick_favorite(raw)
+        if entry is None:
+            yield event.plain_result(f"❌ {err}")
+            return
+        try:
+            removed = await self.voice_vault.remove(str(entry.get("id") or ""))
+        except VoiceVaultError as exc:
+            yield event.plain_result(f"❌ {exc}")
+            return
+        except Exception as exc:
+            logger.error(f"Genie TTS: 删除收藏失败: {exc}")
+            yield event.plain_result(f"❌ 删除失败: {exc}")
+            return
+        label = str(removed.get("alias") or "") or ("#" + str(removed.get("id") or "")[:6])
+        yield event.plain_result(
+            f"🗑 已删除「{label}」。\n{self._favorite_stats_line()}"
+        )
+
+    @filter.command("收藏改名", alias={"tts-fav-rename"})
+    async def rename_favorite_command(self, event: AstrMessageEvent, token: str = ""):
+        """给收藏改个好记的名字：/收藏改名 序号 新名字"""
+        if not self._favorites_enabled():
+            yield event.plain_result(self._favorites_disabled_hint())
+            return
+
+        raw = (
+            self._strip_command_prefix(
+                event.get_message_str(), ("收藏改名", "tts-fav-rename")
+            )
+            or token
+            or ""
+        ).strip()
+        parts = re.split(r"\s+", raw, maxsplit=1)
+        if len(parts) < 2 or not parts[0]:
+            yield event.plain_result(
+                "用法: /收藏改名 序号或旧名 新名字\n名字留空可以清掉名字，改回按序号引用。"
+            )
+            return
+
+        entry, err = await self._pick_favorite(parts[0])
+        if entry is None:
+            yield event.plain_result(f"❌ {err}")
+            return
+        try:
+            updated = await self.voice_vault.rename(
+                str(entry.get("id") or ""), parts[1]
+            )
+        except VoiceVaultError as exc:
+            yield event.plain_result(f"❌ {exc}")
+            return
+        except Exception as exc:
+            logger.error(f"Genie TTS: 收藏改名失败: {exc}")
+            yield event.plain_result(f"❌ 改名失败: {exc}")
+            return
+        updated = dict(updated)
+        updated["index"] = self._favorite_index(str(updated.get("id") or ""))
+        yield event.plain_result("✏️ 已改名\n" + self._format_favorite_row(updated))
+
+    @filter.command("收藏备注", alias={"tts-fav-note"})
+    async def note_favorite_command(self, event: AstrMessageEvent, token: str = ""):
+        """给收藏补一段正文/备注，方便用关键词搜到：/收藏备注 序号 文本"""
+        if not self._favorites_enabled():
+            yield event.plain_result(self._favorites_disabled_hint())
+            return
+
+        raw = (
+            self._strip_command_prefix(
+                event.get_message_str(), ("收藏备注", "tts-fav-note")
+            )
+            or token
+            or ""
+        ).strip()
+        parts = re.split(r"\s+", raw, maxsplit=1)
+        if not parts or not parts[0]:
+            yield event.plain_result(
+                "用法: /收藏备注 序号或名字 备注文本\n备注留空则清掉原有备注。"
+            )
+            return
+
+        entry, err = await self._pick_favorite(parts[0])
+        if entry is None:
+            yield event.plain_result(f"❌ {err}")
+            return
+        body = parts[1] if len(parts) > 1 else ""
+        try:
+            updated = await self.voice_vault.update(
+                str(entry.get("id") or ""), text=body
+            )
+        except VoiceVaultError as exc:
+            yield event.plain_result(f"❌ {exc}")
+            return
+        except Exception as exc:
+            logger.error(f"Genie TTS: 收藏备注失败: {exc}")
+            yield event.plain_result(f"❌ 备注失败: {exc}")
+            return
+        updated = dict(updated)
+        updated["index"] = self._favorite_index(str(updated.get("id") or ""))
+        yield event.plain_result("📝 备注已更新\n" + self._format_favorite_row(updated))
+
+    @filter.command("收藏置顶", alias={"tts-fav-pin"})
+    async def pin_favorite_command(self, event: AstrMessageEvent, token: str = ""):
+        """置顶/取消置顶一条收藏。置顶的永远排在前面，也永远不会被容量淘汰"""
+        if not self._favorites_enabled():
+            yield event.plain_result(self._favorites_disabled_hint())
+            return
+
+        raw = (
+            self._strip_command_prefix(
+                event.get_message_str(), ("收藏置顶", "tts-fav-pin")
+            )
+            or token
+            or ""
+        ).strip()
+        if not raw:
+            yield event.plain_result("用法: /收藏置顶 序号或名字（再发一次取消置顶）")
+            return
+
+        entry, err = await self._pick_favorite(raw)
+        if entry is None:
+            yield event.plain_result(f"❌ {err}")
+            return
+        want = not bool(entry.get("pinned"))
+        try:
+            updated = await self.voice_vault.update(
+                str(entry.get("id") or ""), pinned=want
+            )
+        except VoiceVaultError as exc:
+            yield event.plain_result(f"❌ {exc}")
+            return
+        except Exception as exc:
+            logger.error(f"Genie TTS: 收藏置顶失败: {exc}")
+            yield event.plain_result(f"❌ 操作失败: {exc}")
+            return
+        updated = dict(updated)
+        updated["index"] = self._favorite_index(str(updated.get("id") or ""))
+        head = "📌 已置顶" if want else "已取消置顶"
+        yield event.plain_result(head + "\n" + self._format_favorite_row(updated))
+
+    @filter.command("收藏导出", alias={"tts-fav-export", "导出收藏"})
+    async def export_favorites_command(self, event: AstrMessageEvent, token: str = ""):
+        """把收藏打包成 .zip 发出来；给序号则只导出指定几条"""
+        if not self._favorites_enabled():
+            yield event.plain_result(self._favorites_disabled_hint())
+            return
+
+        raw = (
+            self._strip_command_prefix(
+                event.get_message_str(), ("收藏导出", "导出收藏", "tts-fav-export")
+            )
+            or token
+            or ""
+        ).strip()
+
+        self._sync_vault_config()
+        try:
+            await self.voice_vault.load()
+        except Exception as exc:
+            logger.error(f"Genie TTS: 读取收藏库失败: {exc}")
+            yield event.plain_result(f"❌ 读取收藏库失败: {exc}")
+            return
+        if self.voice_vault.count() <= 0:
+            yield event.plain_result("收藏夹还是空的，没什么可导出的。")
+            return
+
+        ids: Optional[List[str]] = None
+        wanted = [item for item in re.split(r"[,，\s]+", raw) if item]
+        if wanted:
+            picked: List[str] = []
+            for item in wanted:
+                entry, err = self.voice_vault.resolve(item)
+                if entry is None:
+                    yield event.plain_result(f"❌ {err}")
+                    return
+                entry_id = str(entry.get("id") or "")
+                if entry_id and entry_id not in picked:
+                    picked.append(entry_id)
+            ids = picked
+
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        dest = self._vault_bundle_dir() / f"{self.VAULT_BUNDLE_PREFIX}-{stamp}.zip"
+        try:
+            result = await self.voice_vault.export_bundle(dest, ids)
+        except VoiceVaultError as exc:
+            yield event.plain_result(f"❌ {exc}")
+            return
+        except Exception as exc:
+            logger.error(f"Genie TTS: 导出收藏失败: {exc}")
+            yield event.plain_result(f"❌ 导出失败: {exc}")
+            return
+
+        try:
+            size = dest.stat().st_size
+        except OSError:
+            size = 0
+        yield event.plain_result(
+            "📦 收藏包已导出\n"
+            f"内容: {result.get('count')} 条（{audio_compat.format_size(size)}）\n"
+            f"服务端快照: {dest.name}\n"
+            "恢复: 把这个 .zip 连同 /收藏导入 一起发回来，"
+            "或在工作台「语音收藏」页导入。"
+        )
+
+        ok, channel = await self._send_voice_as_file(event, str(dest), dest.name)
+        if not ok:
+            yield event.plain_result(
+                f"⚠ 压缩包没发出去（{channel}）。"
+                "文件已存在服务端，可去 WebUI 工作台「语音收藏」页下载。"
+            )
+
+    @filter.command("收藏导入", alias={"tts-fav-import", "导入收藏"})
+    async def import_favorites_command(self, event: AstrMessageEvent, mode: str = ""):
+        """导入收藏包 .zip：上传附件，或引用一条带附件的消息"""
+        if not self._favorites_enabled():
+            yield event.plain_result(self._favorites_disabled_hint())
+            return
+
+        raw = (
+            self._strip_command_prefix(
+                event.get_message_str(), ("收藏导入", "导入收藏", "tts-fav-import")
+            )
+            or ""
+        ).strip()
+        chosen = ""
+        for item in [x for x in re.split(r"\s+", raw) if x]:
+            if item.lower() in self.VAULT_MODE_TOKENS or item in self.VAULT_MODE_TOKENS:
+                chosen = item
+                break
+        if not chosen:
+            hint = (mode or "").strip()
+            if hint.lower() in self.VAULT_MODE_TOKENS or hint in self.VAULT_MODE_TOKENS:
+                chosen = hint
+
+        path, origin = await self._bundle_path_from_event(event)
+        if not path:
+            yield event.plain_result(
+                "❌ 没找到收藏包文件。两种用法：\n"
+                "1) 上传 /收藏导出 给的 .zip，在同一条消息里写 /收藏导入\n"
+                "2) 引用那条带 .zip 的消息，再发 /收藏导入\n"
+                "模式：merge 只补新（默认）/ overwrite 冲突覆盖 / replace 先清空\n"
+                "也可以在 WebUI 工作台「语音收藏」页直接拖文件导入。"
+            )
+            return
+
+        self._sync_vault_config()
+        resolved_mode = voice_vault.normalize_import_mode(chosen)
+        try:
+            report = await self.voice_vault.import_bundle(path, resolved_mode)
+        except VoiceVaultError as exc:
+            yield event.plain_result(f"❌ {exc}")
+            return
+        except Exception as exc:
+            logger.error(f"Genie TTS: 导入收藏失败: {exc}")
+            yield event.plain_result(f"❌ 导入失败: {exc}")
+            return
+
+        yield event.plain_result(
+            "📥 收藏包导入完成\n"
+            f"来源: {origin} · 模式: {resolved_mode}\n"
+            + voice_vault.describe_import(report)
+            + "\n"
+            + self._favorite_stats_line()
+        )
+
+    @filter.command("收藏清空", alias={"tts-fav-clear", "清空收藏"})
+    async def clear_favorites_command(self, event: AstrMessageEvent, token: str = ""):
+        """清空收藏夹。必须显式加「确认」，默认保留置顶"""
+        if not self._favorites_enabled():
+            yield event.plain_result(self._favorites_disabled_hint())
+            return
+
+        raw = (
+            self._strip_command_prefix(
+                event.get_message_str(), ("收藏清空", "清空收藏", "tts-fav-clear")
+            )
+            or token
+            or ""
+        ).strip()
+        tokens = [x for x in re.split(r"\s+", raw) if x]
+        confirmed = any(
+            x.lower() in self.VAULT_CONFIRM_TOKENS or x in self.VAULT_CONFIRM_TOKENS
+            for x in tokens
+        )
+        include_pinned = any(
+            x.lower() in self.VAULT_PINNED_TOKENS or x in self.VAULT_PINNED_TOKENS
+            for x in tokens
+        )
+
+        self._sync_vault_config()
+        try:
+            await self.voice_vault.load()
+        except Exception as exc:
+            logger.error(f"Genie TTS: 读取收藏库失败: {exc}")
+            yield event.plain_result(f"❌ 读取收藏库失败: {exc}")
+            return
+
+        stats = self.voice_vault.stats()
+        total = int(stats.get("count") or 0)
+        pinned = int(stats.get("pinned") or 0)
+        if total <= 0:
+            yield event.plain_result("收藏夹已经是空的了。")
+            return
+
+        if not confirmed:
+            target = total if include_pinned else total - pinned
+            yield event.plain_result(
+                "⚠ 这一步会真删音频文件，不可撤销。\n"
+                f"将删除 {target} 条"
+                + ("（含置顶）" if include_pinned else f"，保留 {pinned} 条置顶")
+                + "。\n确认请发: /收藏清空 确认"
+                + ("含置顶" if include_pinned else "")
+                + "\n只想删一条: /删收藏 序号"
+            )
+            return
+
+        try:
+            removed = await self.voice_vault.clear(keep_pinned=not include_pinned)
+        except Exception as exc:
+            logger.error(f"Genie TTS: 清空收藏失败: {exc}")
+            yield event.plain_result(f"❌ 清空失败: {exc}")
+            return
+        yield event.plain_result(
+            f"🧹 已清空 {removed} 条收藏。\n{self._favorite_stats_line()}"
+        )
 
     @filter.command("tts-help", alias={"语音帮助"})
     async def tts_help(self, event: AstrMessageEvent):
@@ -1719,6 +3024,15 @@ class GenieTtsLlmPlugin(Star):
             "【合成】\n"
             "• /合成 角色 感情 文本 手动合成一条语音\n"
             "• /tts-again（重发语音）重发本会话最近一条语音\n"
+            "【语音收藏】引用我发的语音再发指令\n"
+            "• /语音收藏 [名字]（tts-fav）原样收进收藏夹，音质无损\n"
+            "• /收藏列表 [页码|关键词]（tts-favs）看收藏与序号\n"
+            "• /发收藏 序号或名字（播放收藏）直接发出来听\n"
+            "• /收藏文件 序号或名字 把收藏当文件发来存档\n"
+            "• /语音转文件（语音存文件）引用一条语音直接转文件\n"
+            "• /收藏改名 序号 新名 · /收藏备注 序号 文本 · /收藏置顶 序号\n"
+            "• /删收藏 序号 · /收藏清空 确认 [含置顶]\n"
+            "• /收藏导出 [序号…] · /收藏导入 [模式]（.zip 整包搬家）\n"
             "【感情包】\n"
             "• /感情导出 [角色] 导出感情包 JSON（省略角色=全部）\n"
             "• /感情导入 [模式] [试运行] 附 JSON / 引用消息 / 上传文件\n"
@@ -1731,7 +3045,7 @@ class GenieTtsLlmPlugin(Star):
             "• /tts-help（语音帮助）显示本帮助\n"
             "开关与音色选择会自动持久化，重启 AstrBot 后不会丢。\n"
             "更省事的做法：在 AstrBot WebUI 的插件页打开「语音合成工作台」，"
-            "可视化管理感情、试听分段、导入导出感情包。"
+            "可视化管理感情、试听分段、收藏语音、导入导出感情包与收藏包。"
         )
 
     @filter.llm_tool(name="genie_tts_speak")
@@ -1885,7 +3199,13 @@ class GenieTtsLlmPlugin(Star):
                 "语音发送失败：TTS 合成没有成功，请检查服务状态或日志。"
                 + self.TOOL_INTERNAL_FAILURE_TAIL
             )
-        self._remember_last_audio(session_id, audio_path)
+        self._remember_last_audio(
+            session_id,
+            audio_path,
+            text=display_text,
+            character=char_name,
+            emotion=resolved_emotion,
+        )
 
         ok, error_message = await self._dispatch_llm_tool_tts_output(
             session_id=session_id,
@@ -2189,7 +3509,13 @@ class GenieTtsLlmPlugin(Star):
             trace.ok(audio_path=audio_path)
         else:
             trace.fail("TTS合成失败")
-        return self._remember_last_audio(session_id, audio_path)
+        return self._remember_last_audio(
+            session_id,
+            audio_path,
+            text=text,
+            character=char_name,
+            emotion=emotion_name,
+        )
 
     @filter.on_llm_request()
     async def inject_llm_prompt(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -2569,7 +3895,13 @@ class GenieTtsLlmPlugin(Star):
         )
 
         if audio_path:
-            self._remember_last_audio(session_id, audio_path)
+            self._remember_last_audio(
+                session_id,
+                audio_path,
+                text=display_text or target_text,
+                character=char_name,
+                emotion=target_emotion,
+            )
             audio_sent = await self._apply_auto_tts_output_mode(
                 session_id=session_id,
                 resp=resp,
