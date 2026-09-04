@@ -611,7 +611,7 @@ class GenieWebApi:
                         config.get("enable_tts_truncation_guard"), True
                     ),
                     "state_persistence": _as_bool(config.get("enable_state_persistence"), True),
-                    "failure_notice": _as_bool(config.get("enable_tts_failure_notice"), True),
+                    "failure_notice": _as_bool(config.get("enable_tts_failure_notice"), False),
                     "keepalive": _as_bool(config.get("enable_space_keepalive")),
                     "group_default": _as_bool(config.get("enable_group_tts_by_default")),
                 },

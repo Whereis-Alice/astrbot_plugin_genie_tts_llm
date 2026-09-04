@@ -26,14 +26,17 @@ from .run_log import RunLog
     "astrbot_plugin_genie_tts_llm",
     "Whereis-Alice",
     "一个通过 LLM、翻译和 Genie TTS 实现语音合成的插件，支持主动语音工具",
-    "1.9.5",
+    "1.9.6",
     "https://github.com/Whereis-Alice/astrbot_plugin_genie_tts_llm",
 )
 class GenieTtsLlmPlugin(Star):
     # 会话开关/音色选择的持久化键。AstrBot 的插件 KV 存储按 plugin_id 隔离。
     STATE_KV_KEY = "session_state_v1"
+    # 一次性迁移标记：v1.9.6 把「失败提示追加到回复」的默认值从开改成了关。
+    # 老安装的配置文件里已经写着 true，只改 schema 默认值救不了它们，得迁移一次。
+    NOTICE_MIGRATION_KV_KEY = "failure_notice_default_off_v196"
     # 插件版本号：WebUI 总览与感情包元数据都会读它。
-    PLUGIN_VERSION = "1.9.5"
+    PLUGIN_VERSION = "1.9.6"
     # 感情包快照目录名（位于插件数据目录下）。
     PACK_DIR_NAME = "emotion_packs"
     # 能被识别为「导入模式」的 token，真正的语义交给 emotion_pack 归一化。
@@ -60,6 +63,12 @@ class GenieTtsLlmPlugin(Star):
     # 清理 LLM 复读的历史 TTS 失败提示。整条匹配，不留残渣。
     TTS_FAILURE_NOTICE_PATTERN = re.compile(
         r"\n?\(TTS(?:失败[：:][^)]*|合成失败|音频发送失败)\)"
+    )
+    # LLM 工具遇到「内部管道坏了」时回给模型的收尾约束。工具返回值会进模型上下文，
+    # 不加这句的话模型很容易把「请检查翻译配置或日志」原样念给用户听。
+    TOOL_INTERNAL_FAILURE_TAIL = (
+        "回复用户时只用角色口吻简短提一句这次没能发出语音，"
+        "不要复述工具名、配置项、日志或任何技术细节。"
     )
 
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -91,6 +100,7 @@ class GenieTtsLlmPlugin(Star):
         self._state_lock = asyncio.Lock()
         self._state_restored = asyncio.Event()
         self._state_restore_task: Optional[asyncio.Task] = None
+        self._config_migration_task: Optional[asyncio.Task] = None
 
         # 初始化辅助模块
         plugin_data_dir = StarTools.get_data_dir("astrbot_plugin_genie_tts_llm")
@@ -120,6 +130,10 @@ class GenieTtsLlmPlugin(Star):
 
         # KV 读取是协程，__init__ 里只能挂后台任务；恢复完成后置位 _state_restored。
         self._state_restore_task = asyncio.create_task(self._restore_state())
+        # 配置默认值迁移同样要读 KV，一并挂到后台。
+        self._config_migration_task = asyncio.create_task(
+            self._migrate_failure_notice_default()
+        )
 
         # 注册 WebUI 语音合成工作台。注册失败只记日志，不影响插件主流程。
         self.web_api = None
@@ -210,6 +224,35 @@ class GenieTtsLlmPlugin(Star):
         finally:
             self._state_restored.set()
 
+    async def _migrate_failure_notice_default(self) -> None:
+        """把老安装的「失败提示追加到回复」关掉一次。
+
+        这一项在 v1.9.6 之前默认是开的，AstrBot 会把当时的默认值写进
+        data/config 里的插件配置文件，所以单改 schema 默认值对已经装过的实例无效。
+        迁移只做一次（做完写 KV 标记），之后用户自己再打开就不会又被关掉。
+        """
+        try:
+            if await self.get_kv_data(self.NOTICE_MIGRATION_KV_KEY, False):
+                return
+            if self.config.get("enable_tts_failure_notice", False):
+                self.config["enable_tts_failure_notice"] = False
+                try:
+                    self.config.save_config()
+                except Exception:
+                    # 存不下就把内存里的值还原，别让这次运行的行为和配置文件不一致。
+                    self.config["enable_tts_failure_notice"] = True
+                    raise
+                logger.info(
+                    "Genie TTS: 已按 v1.9.6 的新默认值关闭「失败提示追加到回复」，"
+                    "合成失败改到 WebUI 工作台的「日志」页查看；"
+                    "想要旧行为可以在「配置 → 输出形态」里重新打开。"
+                )
+            await self.put_kv_data(self.NOTICE_MIGRATION_KV_KEY, True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"Genie TTS: 失败提示默认值迁移失败（不影响本次运行）: {exc}")
+
     async def _persist_state(self) -> None:
         """把会话/群组开关与音色选择写回插件 KV 存储。失败只告警，不影响本次指令。"""
         if not self._state_persistence_enabled():
@@ -247,9 +290,15 @@ class GenieTtsLlmPlugin(Star):
         return audio_path
 
     def _append_tts_failure_notice(self, resp: LLMResponse, reason: str) -> None:
-        """在回复末尾追加 TTS 失败提示；用户可在配置里关掉这些提示。"""
-        if not self.config.get("enable_tts_failure_notice", True):
-            logger.info(f"TTS 失败提示已按配置隐藏: {reason}")
+        """把 TTS 失败提示追加到回复末尾。默认关闭。
+
+        内部管道的失败不该挤进对话内容（"里面还有一只粉色小猪(TTS合成失败)" 就是典型），
+        所以 v1.9.6 起失败默认只落到 WebUI「日志」页，想要旧行为的去「配置 → 输出形态」打开。
+        """
+        if not self.config.get("enable_tts_failure_notice", False):
+            # 提示不进聊天之后，日志就是这次失败唯一的出口：用 WARNING 才能被日志页
+            # 的「只看问题」一档筛出来。
+            logger.warning(f"Genie TTS: {reason}（失败提示未追加到回复，按配置隐藏）")
             return
         resp.result_chain.chain.append(Comp.Plain(f"\n({reason})"))
 
@@ -655,22 +704,27 @@ class GenieTtsLlmPlugin(Star):
         full_display_text: str,
         plain_display_text: str,
         output_mode: str,
-    ) -> None:
+    ) -> bool:
+        """把合成好的语音接到这次回复上，返回语音是否真的送出去了。"""
         if output_mode == "audio_only":
             resp.result_chain.chain = [Comp.Record(file=audio_path)]
-            return
+            return True
 
         audio_sent = await self._send_audio_message(session_id, audio_path)
         if audio_sent:
             resp.completion_text = plain_display_text
             resp.result_chain.chain = [Comp.Plain(plain_display_text)]
-            return
+            return True
 
+        # 语音已经合成好了，只是发不出去。这里以前硬拼一行 "(TTS音频发送失败)"：
+        # 既绕过了失败提示开关，也从来不写日志，于是日志页里查不到这类失败。
+        logger.warning(
+            f"Genie TTS: [{session_id}] 语音已合成但音频发送失败，本次回退为纯文本。"
+        )
         resp.completion_text = full_display_text
-        resp.result_chain.chain = [
-            Comp.Plain(full_display_text),
-            Comp.Plain("\n(TTS音频发送失败)"),
-        ]
+        resp.result_chain.chain = [Comp.Plain(full_display_text)]
+        self._append_tts_failure_notice(resp, "TTS音频发送失败")
+        return False
 
     async def _dispatch_llm_tool_tts_output(
         self,
@@ -1773,7 +1827,10 @@ class GenieTtsLlmPlugin(Star):
 
         if not target_text:
             trace.fail("译文准备失败")
-            return "语音发送失败：用于 TTS 的文本准备失败了，请检查翻译配置或日志。"
+            return (
+                "语音发送失败：用于 TTS 的文本准备失败了，请检查翻译配置或日志。"
+                + self.TOOL_INTERNAL_FAILURE_TAIL
+            )
         if target_text != display_text:
             trace.set(translated_text=target_text, translated=True)
 
@@ -1801,7 +1858,10 @@ class GenieTtsLlmPlugin(Star):
 
             if not tts_target_text:
                 trace.fail("混合模式译文准备失败")
-                return "语音发送失败：混合模式下用于 TTS 的文本准备失败了，请检查翻译配置或日志。"
+                return (
+                    "语音发送失败：混合模式下用于 TTS 的文本准备失败了，"
+                    "请检查翻译配置或日志。" + self.TOOL_INTERNAL_FAILURE_TAIL
+                )
 
         if not has_pronounceable(tts_target_text):
             trace.skip("无可朗读字符", tts_text=tts_target_text)
@@ -1821,7 +1881,10 @@ class GenieTtsLlmPlugin(Star):
         )
         if not audio_path:
             trace.fail("TTS合成失败")
-            return "语音发送失败：TTS 合成没有成功，请检查服务状态或日志。"
+            return (
+                "语音发送失败：TTS 合成没有成功，请检查服务状态或日志。"
+                + self.TOOL_INTERNAL_FAILURE_TAIL
+            )
         self._remember_last_audio(session_id, audio_path)
 
         ok, error_message = await self._dispatch_llm_tool_tts_output(
@@ -1836,6 +1899,7 @@ class GenieTtsLlmPlugin(Star):
             return (
                 (error_message or "语音已经合成成功，但 AstrBot 主动发送失败了。")
                 + "请确认当前会话对应的平台实例仍然在线。"
+                + self.TOOL_INTERNAL_FAILURE_TAIL
             )
 
         trace.ok(audio_path=audio_path)
@@ -2505,9 +2569,8 @@ class GenieTtsLlmPlugin(Star):
         )
 
         if audio_path:
-            trace.ok(audio_path=audio_path)
             self._remember_last_audio(session_id, audio_path)
-            await self._apply_auto_tts_output_mode(
+            audio_sent = await self._apply_auto_tts_output_mode(
                 session_id=session_id,
                 resp=resp,
                 audio_path=audio_path,
@@ -2515,6 +2578,12 @@ class GenieTtsLlmPlugin(Star):
                 plain_display_text=plain_display_text,
                 output_mode=output_mode,
             )
+            # 收尾放在发送之后：合成成功但没送出去也算这次失败，否则日志页只会显示
+            # 一条「成功」，用户根本查不到。和 LLM 工具那条链路的记法保持一致。
+            if audio_sent:
+                trace.ok(audio_path=audio_path)
+            else:
+                trace.fail("音频发送失败", audio_path=audio_path)
         else:
             trace.fail("TTS合成失败")
             self._append_tts_failure_notice(resp, "TTS合成失败")
@@ -2541,6 +2610,10 @@ class GenieTtsLlmPlugin(Star):
         if self._state_restore_task and not self._state_restore_task.done():
             self._state_restore_task.cancel()
             await asyncio.gather(self._state_restore_task, return_exceptions=True)
+
+        if self._config_migration_task and not self._config_migration_task.done():
+            self._config_migration_task.cancel()
+            await asyncio.gather(self._config_migration_task, return_exceptions=True)
 
         await self.tts_engine.terminate()
         await self.http_client.aclose()
