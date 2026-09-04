@@ -47,16 +47,64 @@ function h(tag, attrs, kids) {
 
 function clear(node) { while (node && node.firstChild) node.removeChild(node.firstChild); return node; }
 
-/* 切分区后把滚动位置拉回顶部。
-   插件页跑在 iframe 里，topbar / tabbar 都是 sticky，如果不复位，
-   从长分区（比如感情库）切到别的分区时视口还停在页尾，看起来像「没切过去」。
-   harness 的 window 没有 scrollTo，所以每一步都做 typeof 判断 + try/catch。 */
-function scrollTopSafe() {
+/* ------------------------------------------------------------ 滚动
+   插件页跑在 iframe 里，滚的是文档本身（topbar / tabbar 是 sticky）。
+   harness 的 window 只有 scrollTo，别的一概没有，所以每一步都 typeof + try/catch。 */
+
+function scrollYSafe() {
+  try { if (typeof window !== "undefined" && typeof window.pageYOffset === "number") return window.pageYOffset; } catch (e1) {}
+  try { if (D.documentElement && typeof D.documentElement.scrollTop === "number") return D.documentElement.scrollTop; } catch (e2) {}
+  try { if (D.body && typeof D.body.scrollTop === "number") return D.body.scrollTop; } catch (e3) {}
+  return 0;
+}
+
+function scrollToSafe(y) {
+  y = Number(y) || 0;
+  if (y < 0) y = 0;
   try {
-    if (typeof window !== "undefined" && typeof window.scrollTo === "function") window.scrollTo(0, 0);
+    if (typeof window !== "undefined" && typeof window.scrollTo === "function") { window.scrollTo(0, y); return; }
   } catch (e1) {}
-  try { if (D.documentElement) D.documentElement.scrollTop = 0; } catch (e2) {}
-  try { if (D.body) D.body.scrollTop = 0; } catch (e3) {}
+  try { if (D.documentElement) { D.documentElement.scrollTop = y; return; } } catch (e2) {}
+  try { if (D.body) D.body.scrollTop = y; } catch (e3) {}
+}
+
+/* 切分区后把滚动位置拉回顶部。不复位的话，从长分区（比如感情库）切到别的
+   分区时视口还停在页尾，看起来像「没切过去」。 */
+function scrollTopSafe() { scrollToSafe(0); }
+
+/* 原地重画一个分区时保住视口位置。
+   clear(view) 会先把内容全删掉，文档瞬间变短，浏览器立刻把 scrollTop 夹到
+   新的最大值（往往就是 0）；等内容补回来，滚动条已经回页首了 —— 从用户角度
+   看就是「点一下展开，页面自己往上跳」。这里做两件事：重画期间给容器钉住
+   原来的高度，让文档别缩；重画完再把 scrollTop 写回去兜第二道。
+   offsetHeight 在 harness 里不存在，所以只在拿得到数字时才钉高度。 */
+/* 节点是否还挂在文档上。整页重画之后旧节点的 parentNode 往往仍指向一个
+   已经被摘掉的容器，光看 parentNode 会误判成「还在」，往上插新节点就成了空操作。 */
+function attachedSafe(node) {
+  var p = node;
+  var guard = 0;
+  while (p && guard++ < 400) {
+    if (p === D.documentElement || p === D.body || p.localName === "html") return true;
+    p = p.parentNode;
+  }
+  return false;
+}
+
+function keepScroll(node, fn) {
+  var y = scrollYSafe();
+  var lock = null;
+  try {
+    if (node && node.style && typeof node.offsetHeight === "number" && node.offsetHeight > 0) {
+      lock = node.style.minHeight || "";
+      node.style.minHeight = node.offsetHeight + "px";
+    }
+  } catch (e1) {}
+  try {
+    fn();
+  } finally {
+    try { if (lock !== null && node && node.style) node.style.minHeight = lock; } catch (e2) {}
+    try { if (scrollYSafe() !== y) scrollToSafe(y); } catch (e3) {}
+  }
 }
 
 /* ------------------------------------------------------------ 格式化 */
@@ -362,7 +410,7 @@ var TABS = [
 
 var state = {
   tab: "studio",
-  prefs: { theme: "moonlit", density: "comfortable", tab: "studio", themes: [], densities: ["comfortable", "compact"] },
+  prefs: { theme: "moonlit", density: "comfortable", tab: "studio", log_paint: true, themes: [], densities: ["comfortable", "compact"] },
   overview: null,
   emotions: null,
   packs: null,
@@ -383,13 +431,15 @@ var state = {
   pack: { importText: "", mode: "merge", report: null, note: "", filename: "", dry: true, fileName: "" },
   cfg: { dirty: {}, needsReload: false, saving: false },
   /* 日志面板：sub 选子视图，其余是两套互不干扰的服务端筛选条件。
-     lastKey 记最后一次按键时间，自动刷新在打字时会让路，避免输入框被重渲染打断。 */
+     lastKey 记最后一次按键时间，自动刷新在打字时会让路，避免输入框被重渲染打断。
+     paint 控制运行日志的正文着色；recNodes 记住每条合成记录的 DOM 节点，
+     展开/折叠只换那一条，不整页重画（否则视口会被浏览器夹回页首）。 */
   logsUI: {
     sub: "synths",
     q: "", level: "", tag: "",
     sq: "", status: "", source: "", character: "",
     auto: false, seq: 0, timer: null, debounce: null, lastKey: 0,
-    loading: false, expanded: {}, stats: 60
+    loading: false, expanded: {}, stats: 60, paint: true, recNodes: {}
   }
 };
 
@@ -440,7 +490,10 @@ function savePrefs() {
   if (prefTimer) clearTimeout(prefTimer);
   prefTimer = setTimeout(function () {
     prefTimer = null;
-    apiPost("prefs/save", { theme: state.prefs.theme, density: state.prefs.density, tab: state.tab })
+    apiPost("prefs/save", {
+      theme: state.prefs.theme, density: state.prefs.density, tab: state.tab,
+      log_paint: !!state.logsUI.paint
+    })
       .catch(function () { /* 偏好保存失败不打扰用户 */ });
   }, 420);
 }
@@ -684,6 +737,8 @@ async function init() {
     return;
   }
   if (prefs) state.prefs = Object.assign(state.prefs, prefs);
+  /* 日志着色开关也存在偏好里，缺省为开（老快照里没有这个键）。 */
+  if (prefs && prefs.log_paint !== undefined) state.logsUI.paint = !!prefs.log_paint;
   state.overview = overview;
   if (overview && overview.defaults) {
     state.studio.character = overview.defaults.character || "";
@@ -2876,16 +2931,20 @@ function fetchLogs() {
     });
 }
 
+/* 日志页是全站唯一会自己定时重画的分区，所以重画一律走保位版本：
+   否则开着自动刷新往下翻记录，每 5 秒就被弹回页首一次。 */
+function renderLogsKeep() { keepScroll(viewNode("logs"), renderLogs); }
+
 function reloadLogs(silent) {
   return fetchLogs().then(function () {
-    renderLogs();
+    renderLogsKeep();
     if (!silent) toast("日志已刷新", "ok", 1600);
   }, function (e) { fail(e, "刷新失败"); });
 }
 
 function setLogFilter(key, value) {
   state.logsUI[key] = value;
-  return fetchLogs().then(function () { renderLogs(); });
+  return fetchLogs().then(function () { renderLogsKeep(); });
 }
 
 /* 重渲染会换掉输入框节点，所以刷新前记住焦点、刷新后按 id 找回去。 */
@@ -2915,7 +2974,7 @@ function logsSearchChanged() {
     u.debounce = null;
     if (state.tab !== "logs") return;
     var focus = focusedLogSearchId();
-    fetchLogs().then(function () { renderLogs(); refocusLogSearch(focus); });
+    fetchLogs().then(function () { renderLogsKeep(); refocusLogSearch(focus); });
   }, 420);
 }
 
@@ -2937,7 +2996,7 @@ function logsAutoTick() {
   if (!u.auto || state.tab !== "logs") return;   /* 离开日志页就自然停掉 */
   if (Date.now() - u.lastKey < 3000) { logsAutoArm(); return; }   /* 正在打字，让这一轮 */
   var focus = focusedLogSearchId();
-  fetchLogs().then(function () { renderLogs(); refocusLogSearch(focus); });
+  fetchLogs().then(function () { renderLogsKeep(); refocusLogSearch(focus); });
 }
 
 function clearLogs(scope) {
@@ -2952,7 +3011,8 @@ function clearLogs(scope) {
       var dr = d.dropped || {};
       toast("已清 " + (d.total || 0) + " 条（日志 " + (dr.logs || 0) + " / 合成 " + (dr.synths || 0) + "）", "ok");
       state.logsUI.expanded = {};
-      fetchLogs().then(function () { renderLogs(); refreshOverview(); });
+      state.logsUI.recNodes = {};
+      fetchLogs().then(function () { renderLogs(); scrollTopSafe(); refreshOverview(); });
     }).catch(function (e) { fail(e, "清空失败"); });
   });
 }
@@ -3028,12 +3088,61 @@ function logQuote(label, text, tone) {
 
 /* ---------- 合成记录 ---------- */
 
+/* 展开 / 折叠只换这一条记录的节点。
+   以前是 renderLogs() 整页重画：clear(view) 一清，文档立刻变短，浏览器把
+   scrollTop 夹到新的最大值，内容补回来时视口已经跑到别的地方了 —— 用户看到的
+   就是「点一下展开，页面自己往上跳」。局部替换既没有这个问题，也顺手把焦点
+   留在点过的那一行上（键盘操作能接着按空格）。 */
+function toggleSynthRec(id) {
+  var u = state.logsUI;
+  var key = String(id);
+  u.expanded[id] = !u.expanded[id];
+
+  var items = (state.synths && state.synths.items) || [];
+  var rec = null;
+  for (var i = 0; i < items.length; i++) {
+    if (String(items[i].id) === key) { rec = items[i]; break; }
+  }
+  var old = u.recNodes[key];
+  if (!rec || !old || !old.parentNode || !attachedSafe(old)) {
+    renderLogsKeep();                                 /* 兜底：数据或节点对不上就整页重画 */
+    return;
+  }
+
+  var before = 0;
+  var measured = false;
+  try {
+    if (typeof old.getBoundingClientRect === "function") { before = old.getBoundingClientRect().top; measured = true; }
+  } catch (e1) {}
+
+  var next = synthRec(rec);
+  try {
+    old.parentNode.insertBefore(next, old);
+    old.parentNode.removeChild(old);
+  } catch (e2) { renderLogsKeep(); return; }
+
+  /* 折叠一条很高的记录时文档会变短，浏览器可能还是会夹掉 scrollTop；
+     按同一行在视口里的位置回填，点过的那行就钉在原地不动。 */
+  if (measured) {
+    try {
+      var delta = next.getBoundingClientRect().top - before;
+      if (delta) scrollToSafe(scrollYSafe() + delta);
+    } catch (e3) {}
+  }
+  try {
+    var nh = next.querySelector(".log-rec-head");
+    if (nh && typeof nh.focus === "function") {
+      try { nh.focus({ preventScroll: true }); } catch (e4) { nh.focus(); }
+    }
+  } catch (e5) {}
+}
+
 function synthRec(r) {
   var u = state.logsUI;
   var open = !!u.expanded[r.id];
   var head = h("button", {
     type: "button", class: "log-rec-head", "aria-expanded": open ? "true" : "false",
-    onclick: function () { u.expanded[r.id] = !u.expanded[r.id]; renderLogs(); }
+    onclick: function () { toggleSynthRec(r.id); }
   }, [
     h("span", { class: "log-rec-time mono", text: String(r.date || "") + " " + String(r.time || "") }),
     badge(r.status_label || r.status || "—", SYNTH_TONES[r.status] || null),
@@ -3043,7 +3152,8 @@ function synthRec(r) {
     h("span", { class: "log-rec-el mono", text: fmtMs(r.elapsed_ms) }),
     h("span", { class: "log-rec-caret", "aria-hidden": "true", text: open ? "▾" : "▸" })
   ]);
-  var wrap = h("div", { class: "log-rec", "data-status": r.status || null }, head);
+  var wrap = h("div", { class: "log-rec", "data-status": r.status || null, "data-rec": String(r.id) }, head);
+  u.recNodes[String(r.id)] = wrap;
   if (!open) {
     var brief = r.llm_text || r.tts_text || r.display_text || r.reason || "";
     if (brief) wrap.appendChild(h("p", { class: "log-rec-text", title: brief, text: shorten(brief, 170) }));
@@ -3134,6 +3244,61 @@ function renderSynthList(v, S, sf) {
 
 /* ---------- 运行日志 ---------- */
 
+/* 一条日志正文里真正值得挑出来的只有几类东西：方括号 ID（会话、[emotion=…]）、
+   引号里的原话、成败关键词、标识符与文件路径、全大写缩写、带单位的数字。
+   分组顺序就是优先级（先具体后宽泛），命中哪一组就套那一组的 class。
+   本文件统一用 new RegExp 拼字符串，不用正则字面量，和上面几处保持一致。 */
+var LOG_TOKEN_CLASSES = [
+  "lt-id", "lt-quote", "lt-bad", "lt-good", "lt-warn", "lt-code", "lt-abbr", "lt-word", "lt-num"
+];
+var LOG_TOKEN_RE = new RegExp(
+  "(\\[[^\\[\\]\\n]{1,160}\\])" +                                    /* [aiocqhttp:GroupMessage:123] [emotion=happy] */
+  "|(\u300c[^\u300d\\n]{0,300}\u300d|\u201c[^\u201d\\n]{0,300}\u201d)" +   /* 「原话」 “原话” */
+  "|(失败|错误|异常|超时|放弃|不可用|无法|拒绝)" +
+  "|(成功|完成|已发送|命中|就绪|已加载|已注册)" +
+  "|(跳过|重试|回退|截断|忽略|降级|警告)" +
+  "|([A-Za-z_][A-Za-z0-9_]*(?:[._/-][A-Za-z0-9_]+)+(?::\\d+)?)" +    /* tts_engine.py:441  emotions.json  aino/normal  Worker-1 */
+  "|([A-Z][A-Z0-9]{1,7}(?![a-z]))" +                                 /* TTS LLM WARNING */
+  "|([A-Za-z][A-Za-z0-9]{1,})" +                                     /* 普通拉丁词：只换等宽字体，不换颜色 */
+  "|(\\d+(?:\\.\\d+)?(?:ms|s|KB|MB|B|%|字|块|条|次|个|秒)?)",
+  "g"
+);
+
+/* 正文长度与 token 数的上限。日志页一屏可能上百行，正文又可能是一整段 LLM 输出，
+   分词是纯前端开销，超了就退回纯文本 —— 宁可不好看，也别把页面卡住。 */
+var LOG_PAINT_MAX_LEN = 1200;
+var LOG_PAINT_MAX_TOKENS = 400;
+
+/* 把一条正文切成若干节点。
+   铁律：所有片段拼回去必须与原文逐字符相同。日志的复制、下载、搜索全靠
+   textContent，这里多插一个字符或少一个空格，导出的文本就跟真实日志不一致了。 */
+function paintLogText(text) {
+  var s = text === null || text === undefined ? "" : String(text);
+  var out = [];
+  if (!s) return out;
+  if (!state.logsUI.paint || s.length > LOG_PAINT_MAX_LEN) {
+    out.push(D.createTextNode(s));
+    return out;
+  }
+  LOG_TOKEN_RE.lastIndex = 0;
+  var last = 0;
+  var count = 0;
+  var m;
+  while ((m = LOG_TOKEN_RE.exec(s)) !== null) {
+    if (m[0] === "") { LOG_TOKEN_RE.lastIndex++; continue; }   /* 空匹配理论上不会有，兜一层死循环 */
+    if (++count > LOG_PAINT_MAX_TOKENS) break;
+    if (m.index > last) out.push(D.createTextNode(s.slice(last, m.index)));
+    var cls = "lt-word";
+    for (var g = 0; g < LOG_TOKEN_CLASSES.length; g++) {
+      if (m[g + 1] !== undefined) { cls = LOG_TOKEN_CLASSES[g]; break; }
+    }
+    out.push(h("span", { class: cls, text: m[0] }));
+    last = m.index + m[0].length;
+  }
+  if (last < s.length) out.push(D.createTextNode(s.slice(last)));
+  return out;
+}
+
 function renderLogList(v, L, lf) {
   var u = state.logsUI;
   var items = L.items || [];
@@ -3158,7 +3323,13 @@ function renderLogList(v, L, lf) {
     body: h("div", { class: "row-tight" }, [
       qInput,
       select(levelOpts, u.level, function (ev) { setLogFilter("level", ev.target.value); }),
-      select(tagOpts, u.tag, function (ev) { setLogFilter("tag", ev.target.value); })
+      select(tagOpts, u.tag, function (ev) { setLogFilter("tag", ev.target.value); }),
+      /* 着色纯前端，关掉就退回纯文本 —— 想整段复制、或者觉得花，随手关掉。 */
+      switchBox(u.paint, "着色", function (ev) {
+        u.paint = !!ev.target.checked;
+        savePrefs();
+        renderLogsKeep();
+      })
     ]),
     sub: true
   }));
@@ -3168,17 +3339,19 @@ function renderLogList(v, L, lf) {
     return;
   }
 
+  /* data-tag 决定这一行的左边条与分类字的色相（14 个分类各一个 hue，见 style.css）；
+     log-dot 是分类前那颗小圆点，扫一眼就能按颜色成组，不用逐行读分类名。 */
   var box = h("div", { class: "log-lines" });
   items.forEach(function (it) {
-    box.appendChild(h("div", { class: "log-line", "data-level": it.level || null }, [
+    box.appendChild(h("div", { class: "log-line", "data-level": it.level || null, "data-tag": it.tag || null }, [
       h("span", { class: "log-time mono", text: it.time || "" }),
       badge(it.level || "INFO", LOG_TONES[it.level] || null),
+      h("i", { class: "log-dot", "aria-hidden": "true" }),
       h("span", { class: "log-tag", text: it.tag_label || it.tag || "" }),
       h("span", {
         class: "log-msg",
-        title: String(it.message || "") + (it.session ? "  ·  会话 " + it.session : ""),
-        text: it.message || ""
-      }),
+        title: String(it.message || "") + (it.session ? "  ·  会话 " + it.session : "")
+      }, paintLogText(it.message)),
       h("span", { class: "log-src mono", text: it.source || "" })
     ]));
   });
@@ -3255,6 +3428,7 @@ function renderEmotionStats(v, S) {
 function renderLogs() {
   var v = clear(viewNode("logs"));
   var u = state.logsUI;
+  u.recNodes = {};                    /* 上一轮的记录节点已经被 clear 摘掉了，别留悬空引用 */
   var L = state.logs || {};
   var S = state.synths || {};
   var lf = L.facets || {};
@@ -3293,11 +3467,17 @@ function renderLogs() {
         stat(String(lf.size || 0) + " / " + String(lf.capacity || 0), "日志缓冲", null),
         stat(String(issues), "警告以上", issues > 0 ? "warn" : null)
       ]),
+      /* 换子视图是换内容，不是换位置：明确回到页首，别把视口留在上一张长表的中段。 */
       segment([
         { value: "synths", label: "合成记录 · " + String(S.total || 0) },
         { value: "logs", label: "运行日志 · " + String(L.total || 0) },
         { value: "stats", label: "情感统计 · " + String((S.emotions || []).length) }
-      ], u.sub, function (val) { u.sub = val; renderLogs(); })
+      ], u.sub, function (val) {
+        if (val === u.sub) return;
+        u.sub = val;
+        renderLogs();
+        scrollTopSafe();
+      })
     ]
   }));
 

@@ -1925,8 +1925,11 @@ class GenieWebApi:
         theme = DEFAULT_THEME
         density = DEFAULT_DENSITY
         tab = ""
+        log_paint = True
         try:
-            stored = await self.plugin.get_kv_data(PREFS_KV_KEY)
+            # default 在部分 AstrBot 版本里是必填位置参数（不是关键字缺省），
+            # 少传就会 TypeError，界面偏好读不回来 —— 主题/密度/分区每次都退回默认值。
+            stored = await self.plugin.get_kv_data(PREFS_KV_KEY, None)
             if isinstance(stored, dict):
                 candidate = _as_text(stored.get("theme"))
                 if candidate in THEME_IDS:
@@ -1935,13 +1938,19 @@ class GenieWebApi:
                 if candidate in DENSITIES:
                     density = candidate
                 tab = _as_text(stored.get("tab"), 32)
+                # 老快照里没有这个键，只有显式写了 false 才算关掉。
+                if "log_paint" in stored:
+                    log_paint = bool(stored.get("log_paint"))
         except Exception as exc:
-            logger.debug("Genie TTS WebUI: 读取界面偏好失败: " + str(exc))
+            # 读不回来只影响主题/密度/分区的记忆，不影响功能，所以不往上抛；
+            # 但要留一条 WARNING，不然「主题每次都变回月夜」会查不到原因。
+            logger.warning("Genie TTS WebUI: 读取界面偏好失败: " + str(exc))
         return self._ok(
             {
                 "theme": theme,
                 "density": density,
                 "tab": tab,
+                "log_paint": log_paint,
                 "themes": [dict(item) for item in THEMES],
                 "densities": list(DENSITIES),
             }
@@ -1960,6 +1969,8 @@ class GenieWebApi:
             "theme": theme or DEFAULT_THEME,
             "density": density or DEFAULT_DENSITY,
             "tab": tab,
+            # 运行日志着色开关：前端传什么就存什么，缺省视为开。
+            "log_paint": bool(body.get("log_paint", True)),
         }
         try:
             await self.plugin.put_kv_data(PREFS_KV_KEY, payload)

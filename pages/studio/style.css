@@ -769,19 +769,67 @@ html[data-density="compact"] .vn-text { min-height: 118px; font-size: 14.5px; li
 
 .log-lines { display: flex; flex-direction: column; border: 1px solid var(--line);
   border-radius: var(--r-md); background: var(--panel-3); overflow: hidden; }
+
+/* 运行日志一行的着色思路（v1.9.7）：
+   1) 每个分类一个色相 --lt-tag —— 左侧细条、分类前的小圆点、分类名共用它，
+      扫一眼就能按颜色成组，不用逐行读分类名；
+   2) 级别（WARNING / ERROR）的左条特异性更高，会盖掉分类色 —— 出问题的行
+      永远优先显示成黄 / 红，不会被分类色淹掉；
+   3) 正文里的 ID、原话、成败关键词、路径、数字由 JS 切成 .lt-* 片段单独上色。
+   所有分类色都用 color-mix 往 var(--text) 里兑：暗色主题自动提亮、亮色主题
+   自动压深，六套配色共用一份色表，不用各写一遍。 */
 .log-line { display: flex; align-items: baseline; gap: 9px; padding: 7px 12px;
-  border-bottom: 1px solid var(--line); }
+  border-bottom: 1px solid var(--line);
+  --lt-tag: var(--text-mute);
+  --lt-code: #4f93d6;
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--lt-tag) 40%, transparent); }
 .log-line:last-child { border-bottom: 0; }
+/* 极淡斑马纹：长列表里帮眼睛咬住行。必须写在 :hover 之前，否则同特异性会盖掉悬停高亮。 */
+.log-line:nth-child(even) { background: color-mix(in srgb, var(--text) 3%, transparent); }
 .log-line:hover { background: var(--accent-soft); }
 .log-line[data-level="WARNING"] { box-shadow: inset 3px 0 0 color-mix(in srgb, var(--warn) 70%, transparent); }
 .log-line[data-level="ERROR"], .log-line[data-level="CRITICAL"] {
   box-shadow: inset 3px 0 0 color-mix(in srgb, var(--danger) 80%, transparent); }
 .log-time { flex: 0 0 auto; color: var(--text-mute); }
-.log-tag { flex: 0 0 auto; min-width: 4.5em; font-size: 11px; color: var(--text-dim); }
+/* 级别 badge 定宽，让后面的分类与正文对齐成列，不然每行起点都在跳。 */
+.log-line .badge { flex: 0 0 auto; min-width: 7.2em; justify-content: center; }
+.log-dot { flex: 0 0 auto; align-self: center; width: 6px; height: 6px; border-radius: 50%;
+  background: color-mix(in srgb, var(--lt-tag) 78%, transparent); }
+.log-tag { flex: 0 0 auto; min-width: 4.5em; font-size: 11px;
+  color: color-mix(in srgb, var(--lt-tag) 66%, var(--text)); }
 .log-msg { min-width: 0; flex: 1; font-size: 12.5px; line-height: 1.55; color: var(--text);
   overflow-wrap: anywhere; word-break: break-word; }
 .log-src { flex: 0 0 auto; font-size: 10.5px; color: var(--text-mute); white-space: nowrap; }
 .log-foot { margin: var(--gap-sm) 0 0; }
+
+/* 分类色表：14 个 key 与 run_log.py 的 TAG_PATTERNS 一一对应（general 用默认的 --text-mute）。
+   webui 是工作台自己戳接口产生的噪音，故意压成灰蓝，别跟真正的业务日志抢注意力。 */
+.log-line[data-tag="synth"]     { --lt-tag: #4aa6ea; }
+.log-line[data-tag="chunk"]     { --lt-tag: #d2a63a; }
+.log-line[data-tag="emotion"]   { --lt-tag: #ef77a6; }
+.log-line[data-tag="prompt"]    { --lt-tag: #a17ff0; }
+.log-line[data-tag="translate"] { --lt-tag: #3ec0dd; }
+.log-line[data-tag="library"]   { --lt-tag: #7cbb4a; }
+.log-line[data-tag="pack"]      { --lt-tag: #2fb99b; }
+.log-line[data-tag="server"]    { --lt-tag: #3fb877; }
+.log-line[data-tag="queue"]     { --lt-tag: #7f92e0; }
+.log-line[data-tag="trigger"]   { --lt-tag: #e8913f; }
+.log-line[data-tag="session"]   { --lt-tag: #cd6fd0; }
+.log-line[data-tag="lifecycle"] { --lt-tag: #9a9fb0; }
+.log-line[data-tag="webui"]     { --lt-tag: #6f7f9c; }
+
+/* 正文片段。克制为主：普通拉丁词只换等宽字体不换颜色，真正上色的是
+   ID、原话、成败关键词、路径与数字这几类「看一眼就想找」的东西。 */
+.log-msg .lt-id { font-family: var(--font-mono); font-size: 11.5px; color: var(--accent); }
+.log-msg .lt-quote { font-family: var(--font-serif); color: var(--accent-2); }
+.log-msg .lt-code { font-family: var(--font-mono); font-size: 11.5px;
+  color: color-mix(in srgb, var(--lt-code) 62%, var(--text)); }
+.log-msg .lt-abbr { font-weight: 600; letter-spacing: .02em; color: var(--accent-2); }
+.log-msg .lt-word { font-family: var(--font-mono); font-size: 11.5px; }
+.log-msg .lt-num { font-family: var(--font-mono); font-weight: 600; color: var(--warn); }
+.log-msg .lt-bad { font-weight: 700; color: var(--danger); }
+.log-msg .lt-good { font-weight: 600; color: var(--ok); }
+.log-msg .lt-warn { font-weight: 600; color: var(--warn); }
 
 html[data-density="compact"] .log-line { padding: 4px 10px; }
 html[data-density="compact"] .log-rec-head { padding: 7px 11px; }
