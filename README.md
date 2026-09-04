@@ -9,6 +9,7 @@ _✨ AstrBot LLM 回复语音合成插件 ✨_
 
 本 fork 基于 [clown145/astrbot_plugin_tts_llm](https://github.com/clown145/astrbot_plugin_tts_llm) 调整。
 
+[![Release](https://img.shields.io/github/v/release/Whereis-Alice/astrbot_plugin_genie_tts_llm?label=Release&color=brightgreen)](https://github.com/Whereis-Alice/astrbot_plugin_genie_tts_llm/releases/latest)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/)
 [![AstrBot](https://img.shields.io/badge/AstrBot-v4.16%2B-orange.svg)](https://github.com/AstrBotDevs/AstrBot)
@@ -45,7 +46,9 @@ _✨ AstrBot LLM 回复语音合成插件 ✨_
 
 ## ⬆️ 更新日志
 
-📜 [查看完整更新日志](CHANGELOG.md)
+📜 [查看完整更新日志](CHANGELOG.md) · 🏷️ [Releases](https://github.com/Whereis-Alice/astrbot_plugin_genie_tts_llm/releases)
+
+从 v1.0.0 起每个版本都打了 tag 并建了对应 release，所以出问题想退回上一版可以直接固定版本安装（见 [插件安装](#-插件安装)）。想看两版之间到底改了什么，compare 页最直观：`https://github.com/Whereis-Alice/astrbot_plugin_genie_tts_llm/compare/v1.9.6...v1.9.7`。
 
 ---
 
@@ -97,6 +100,19 @@ _✨ AstrBot LLM 回复语音合成插件 ✨_
 
   # 重启 AstrBot
   ```
+
+- **固定到某一个版本 (手动)**: 新版本有问题、想先退回上一版时用。可选的版本号见 [Releases](https://github.com/Whereis-Alice/astrbot_plugin_genie_tts_llm/releases)，从 v1.0.0 起每一版都有 tag。
+  ```bash
+  # 全新克隆指定版本
+  git clone --depth 1 --branch v1.9.6 https://github.com/Whereis-Alice/astrbot_plugin_genie_tts_llm.git
+
+  # 已经克隆过的，切到那一版
+  git fetch --tags && git checkout v1.9.6
+
+  # 之后想回到最新
+  git checkout main && git pull
+  ```
+  固定版本后目录处于 detached HEAD 状态，AstrBot 插件市场的「更新」按钮会失效（它走的是 `git pull`），要升级请先执行上面最后一条切回 `main`。
 
 ---
 
